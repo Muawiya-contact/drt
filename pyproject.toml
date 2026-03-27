@@ -1,0 +1,70 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "drt-core"
+version = "0.1.0.dev0"
+description = "Reverse ETL for the code-first data stack"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "drt-hub", email = "masukai9612kf@gmail.com" }]
+keywords = ["reverse-etl", "data-engineering", "dbt", "bigquery", "cli"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.12",
+    "pydantic>=2.0",
+    "jinja2>=3.1",
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+bigquery = ["google-cloud-bigquery>=3.0"]
+mcp = ["fastmcp>=0.1"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "mypy>=1.10",
+    "ruff>=0.4",
+    "types-pyyaml",
+]
+
+[project.scripts]
+drt = "drt.cli.main:app"
+
+[project.urls]
+Homepage = "https://github.com/drt-hub/drt"
+Repository = "https://github.com/drt-hub/drt"
+Issues = "https://github.com/drt-hub/drt/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["drt"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

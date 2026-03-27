@@ -1,0 +1,31 @@
+name: Feature Request
+description: Suggest a new connector, command, or capability
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the use case or pain point.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What would you like drt to do?
+    validations:
+      required: true
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      options:
+        - New source connector
+        - New destination connector
+        - CLI command
+        - Performance
+        - LLM / MCP integration
+        - Other
+    validations:
+      required: true

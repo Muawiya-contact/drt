@@ -1,0 +1,17 @@
+name: notify_slack
+description: "新規ユーザーをSlackに通知"
+model: ref('new_users')
+destination:
+  type: rest_api
+  url: "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+  method: POST
+  headers:
+    Content-Type: "application/json"
+  body_template: |
+    { "text": "New user: {{ row.name }} ({{ row.email }})" }
+sync:
+  mode: full
+  batch_size: 100
+  rate_limit:
+    requests_per_second: 5
+  on_error: skip
