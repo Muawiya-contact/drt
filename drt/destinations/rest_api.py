@@ -9,6 +9,8 @@ Features:
 
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
 
 from drt.config.models import RestApiDestinationConfig, SyncOptions
@@ -27,7 +29,7 @@ class RestApiDestination:
 
     def load(
         self,
-        records: list[dict],
+        records: list[dict[str, Any]],
         config: RestApiDestinationConfig,
         sync_options: SyncOptions,
     ) -> SyncResult:
@@ -40,7 +42,7 @@ class RestApiDestination:
             for i, record in enumerate(records):
                 rate_limiter.acquire()
 
-                body: dict | str
+                body: dict[str, Any] | str
                 if config.body_template:
                     try:
                         body = render_template(config.body_template, record)
@@ -59,8 +61,8 @@ class RestApiDestination:
                     body = record
 
                 def do_request(
-                    _body: dict | str = body,
-                    _headers: dict = headers,
+                    _body: dict[str, Any] | str = body,
+                    _headers: dict[str, Any] = headers,
                 ) -> httpx.Response:
                     response = client.request(
                         method=config.method,

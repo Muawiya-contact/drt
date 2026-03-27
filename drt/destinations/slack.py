@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Any
 
 import httpx
 
@@ -50,7 +51,7 @@ class SlackDestination:
 
     def load(
         self,
-        records: list[dict],
+        records: list[dict[str, Any]],
         config: SlackDestinationConfig,
         sync_options: SyncOptions,
     ) -> SyncResult:

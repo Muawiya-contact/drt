@@ -14,17 +14,17 @@ Example ~/.drt/profiles.yml:
 from __future__ import annotations
 
 from collections.abc import Iterator
+from typing import Any
 
-from drt.config.credentials import DuckDBProfile, ProfileConfig
+from drt.config.credentials import DuckDBProfile
 
 
 class DuckDBSource:
     """Extract records from a DuckDB database."""
 
-    def extract(self, query: str, config: ProfileConfig) -> Iterator[dict]:
-        assert isinstance(config, DuckDBProfile), f"Expected DuckDBProfile, got {type(config)}"
+    def extract(self, query: str, config: DuckDBProfile) -> Iterator[dict[str, Any]]:
         try:
-            import duckdb  # type: ignore[import]
+            import duckdb
         except ImportError as e:
             raise ImportError("DuckDB support requires: pip install drt-core[duckdb]") from e
 
@@ -37,10 +37,9 @@ class DuckDBSource:
         finally:
             conn.close()
 
-    def test_connection(self, config: ProfileConfig) -> bool:
-        assert isinstance(config, DuckDBProfile)
+    def test_connection(self, config: DuckDBProfile) -> bool:
         try:
-            import duckdb  # type: ignore[import]
+            import duckdb
             conn = duckdb.connect(config.database)
             conn.execute("SELECT 1").fetchall()
             conn.close()

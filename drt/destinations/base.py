@@ -4,7 +4,7 @@ Designed with Rust-compatibility in mind: clear boundaries, no magic.
 """
 
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from drt.config.models import SyncOptions
 
@@ -27,9 +27,9 @@ class SyncResult:
 class Destination(Protocol):
     """Load records into an external service."""
 
-    def load(  # type: ignore[empty-body]
+    def load(
         self,
-        records: list[dict],
+        records: list[dict[str, Any]],
         config: object,  # specific config type per destination
         sync_options: SyncOptions,
     ) -> SyncResult:

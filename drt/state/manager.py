@@ -10,6 +10,7 @@ import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
@@ -28,13 +29,14 @@ class StateManager:
         self._state_dir = project_dir / ".drt"
         self._state_file = self._state_dir / "state.json"
 
-    def _load_all(self) -> dict:
+    def _load_all(self) -> dict[str, Any]:
         if not self._state_file.exists():
             return {}
         with self._state_file.open() as f:
-            return json.load(f)
+            result: dict[str, Any] = json.load(f)
+            return result
 
-    def _save_all(self, data: dict) -> None:
+    def _save_all(self, data: dict[str, Any]) -> None:
         self._state_dir.mkdir(exist_ok=True)
         with self._state_file.open("w") as f:
             json.dump(data, f, indent=2)

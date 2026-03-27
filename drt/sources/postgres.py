@@ -16,15 +16,15 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from typing import Any
 
-from drt.config.credentials import PostgresProfile, ProfileConfig
+from drt.config.credentials import PostgresProfile
 
 
 class PostgresSource:
     """Extract records from a PostgreSQL database."""
 
-    def extract(self, query: str, config: ProfileConfig) -> Iterator[dict]:
-        assert isinstance(config, PostgresProfile), f"Expected PostgresProfile, got {type(config)}"
+    def extract(self, query: str, config: PostgresProfile) -> Iterator[dict[str, Any]]:
         conn = self._connect(config)
         try:
             cur = conn.cursor()
@@ -35,8 +35,7 @@ class PostgresSource:
         finally:
             conn.close()
 
-    def test_connection(self, config: ProfileConfig) -> bool:
-        assert isinstance(config, PostgresProfile)
+    def test_connection(self, config: PostgresProfile) -> bool:
         try:
             conn = self._connect(config)
             cur = conn.cursor()
@@ -46,9 +45,9 @@ class PostgresSource:
         except Exception:
             return False
 
-    def _connect(self, config: PostgresProfile):  # type: ignore[return]
+    def _connect(self, config: PostgresProfile) -> Any:
         try:
-            import psycopg2  # type: ignore[import]
+            import psycopg2
         except ImportError as e:
             raise ImportError("PostgreSQL support requires: pip install drt-core[postgres]") from e
 

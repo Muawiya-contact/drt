@@ -4,8 +4,20 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
+
+if TYPE_CHECKING:
+    from drt.config.credentials import BigQueryProfile, DuckDBProfile, PostgresProfile
+    from drt.config.models import SyncConfig
+    from drt.destinations.github_actions import GitHubActionsDestination
+    from drt.destinations.hubspot import HubSpotDestination
+    from drt.destinations.rest_api import RestApiDestination
+    from drt.destinations.slack import SlackDestination
+    from drt.sources.bigquery import BigQuerySource
+    from drt.sources.duckdb import DuckDBSource
+    from drt.sources.postgres import PostgresSource
 
 from drt import __version__
 from drt.cli.output import (
@@ -110,7 +122,7 @@ def run(
         print_sync_start(sync.name, dry_run)
         t0 = time.monotonic()
         try:
-            result = run_sync(sync, source, dest, profile, Path("."), dry_run, state_mgr)
+            result = run_sync(sync, source, dest, profile, Path("."), dry_run, state_mgr)  # type: ignore[arg-type]
         except Exception as e:
             print_error(f"[{sync.name}] Unexpected error: {e}")
             had_errors = True
@@ -192,7 +204,9 @@ def status() -> None:
 # Source / Destination factories
 # ---------------------------------------------------------------------------
 
-def _get_source(profile):  # type: ignore[return]
+def _get_source(
+    profile: BigQueryProfile | DuckDBProfile | PostgresProfile,
+) -> BigQuerySource | DuckDBSource | PostgresSource:
     from drt.config.credentials import BigQueryProfile, DuckDBProfile, PostgresProfile
     from drt.sources.bigquery import BigQuerySource
     from drt.sources.duckdb import DuckDBSource
@@ -207,7 +221,9 @@ def _get_source(profile):  # type: ignore[return]
     raise ValueError(f"Unsupported source type: {type(profile)}")
 
 
-def _get_destination(sync):  # type: ignore[return]
+def _get_destination(
+    sync: SyncConfig,
+) -> RestApiDestination | SlackDestination | GitHubActionsDestination | HubSpotDestination:
     from drt.config.models import (
         GitHubActionsDestinationConfig,
         HubSpotDestinationConfig,

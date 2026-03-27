@@ -16,7 +16,7 @@ from typing import Literal
 import typer
 from jinja2 import Environment, PackageLoader
 
-from drt.config.credentials import ProfileConfig, save_profile
+from drt.config.credentials import BigQueryProfile, save_profile
 
 
 @dataclass
@@ -121,7 +121,7 @@ def scaffold_project(answers: InitAnswers, project_dir: Path) -> list[str]:
         created.append(str(drt_gitignore))
 
     # --- ~/.drt/profiles.yml ---
-    profile = ProfileConfig(
+    profile = BigQueryProfile(
         type="bigquery",
         project=answers.gcp_project,
         dataset=answers.dataset,

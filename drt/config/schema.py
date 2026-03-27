@@ -7,15 +7,16 @@ Used for:
 
 import json
 from pathlib import Path
+from typing import Any
 
 from drt.config.models import ProjectConfig, SyncConfig
 
 
-def generate_project_schema() -> dict:
+def generate_project_schema() -> dict[str, Any]:
     return ProjectConfig.model_json_schema()
 
 
-def generate_sync_schema() -> dict:
+def generate_sync_schema() -> dict[str, Any]:
     return SyncConfig.model_json_schema()
 
 

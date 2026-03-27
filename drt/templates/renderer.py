@@ -4,11 +4,13 @@ Future: replace with MiniJinja (Rust) via PyO3 for zero-dependency binary.
 Interface is intentionally simple to make the swap transparent.
 """
 
+from typing import Any
+
 from jinja2 import BaseLoader, Environment, StrictUndefined
 from jinja2.exceptions import UndefinedError
 
 
-def render_template(template_str: str, row: dict) -> str:
+def render_template(template_str: str, row: dict[str, Any]) -> str:
     """Render a Jinja2 template string with a single row of data.
 
     Variables are accessed as {{ row.field_name }}.

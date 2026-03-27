@@ -32,6 +32,7 @@ Example sync YAML:
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import httpx
 
@@ -55,7 +56,7 @@ class GitHubActionsDestination:
 
     def load(
         self,
-        records: list[dict],
+        records: list[dict[str, Any]],
         config: GitHubActionsDestinationConfig,
         sync_options: SyncOptions,
     ) -> SyncResult:
@@ -86,7 +87,7 @@ class GitHubActionsDestination:
             for record in records:
                 rate_limiter.acquire()
 
-                inputs: dict = {}
+                inputs: dict[str, Any] = {}
                 if config.inputs_template:
                     try:
                         rendered = render_template(config.inputs_template, record)
@@ -96,14 +97,14 @@ class GitHubActionsDestination:
                         result.errors.append(f"inputs_template error: {e}")
                         continue
 
-                payload = {"ref": config.ref}
+                payload: dict[str, Any] = {"ref": config.ref}
                 if inputs:
-                    payload["inputs"] = inputs  # type: ignore[assignment]
+                    payload["inputs"] = inputs
 
                 def do_request(
                     _url: str = url,
-                    _headers: dict = headers,
-                    _payload: dict = payload,
+                    _headers: dict[str, Any] = headers,
+                    _payload: dict[str, Any] = payload,
                 ) -> httpx.Response:
                     response = client.post(_url, json=_payload, headers=_headers)
                     response.raise_for_status()

@@ -29,7 +29,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
 
@@ -160,13 +160,13 @@ def save_profile(
     dir_path.mkdir(parents=True, exist_ok=True)
     profiles_path = dir_path / "profiles.yml"
 
-    data: dict = {}
+    data: dict[str, Any] = {}
     if profiles_path.exists():
         with profiles_path.open() as f:
             data = yaml.safe_load(f) or {}
 
     if isinstance(profile, BigQueryProfile):
-        entry: dict = {
+        entry: dict[str, Any] = {
             "type": "bigquery",
             "project": profile.project,
             "dataset": profile.dataset,

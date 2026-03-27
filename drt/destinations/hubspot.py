@@ -43,6 +43,7 @@ Example sync YAML — deals:
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import httpx
 
@@ -66,7 +67,7 @@ class HubSpotDestination:
 
     def load(
         self,
-        records: list[dict],
+        records: list[dict[str, Any]],
         config: HubSpotDestinationConfig,
         sync_options: SyncOptions,
     ) -> SyncResult:
@@ -111,8 +112,8 @@ class HubSpotDestination:
 
                 def do_upsert(
                     _url: str = upsert_url,
-                    _headers: dict = headers,
-                    _payload: dict = payload,
+                    _headers: dict[str, Any] = headers,
+                    _payload: dict[str, Any] = payload,
                 ) -> httpx.Response:
                     # HubSpot upsert: POST with idProperty deduplicates
                     response = client.post(_url, json=_payload, headers=_headers)
