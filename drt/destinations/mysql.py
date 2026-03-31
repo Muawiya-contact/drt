@@ -21,9 +21,9 @@ import json
 from typing import Any
 
 from drt.config.credentials import resolve_env
-from drt.config.models import MySQLDestinationConfig, SyncOptions
+from drt.config.models import DestinationConfig, MySQLDestinationConfig, SyncOptions
 from drt.destinations.base import SyncResult
-from drt.destinations.row_errors import DetailedSyncResult, RowError
+from drt.destinations.row_errors import RowError
 
 
 class MySQLDestination:
@@ -32,14 +32,15 @@ class MySQLDestination:
     def load(
         self,
         records: list[dict[str, Any]],
-        config: MySQLDestinationConfig,
+        config: DestinationConfig,
         sync_options: SyncOptions,
     ) -> SyncResult:
+        assert isinstance(config, MySQLDestinationConfig)
         if not records:
             return SyncResult()
 
         conn = self._connect(config)
-        result = DetailedSyncResult()
+        result = SyncResult()
 
         try:
             cur = conn.cursor()
@@ -65,7 +66,7 @@ class MySQLDestination:
                     )
                     if sync_options.on_error == "fail":
                         conn.rollback()
-                        return result  # type: ignore[return-value]
+                        return result
                     conn.rollback()
                     cur = conn.cursor()
                     continue
@@ -74,7 +75,7 @@ class MySQLDestination:
         finally:
             conn.close()
 
-        return result  # type: ignore[return-value]
+        return result
 
     @staticmethod
     def _build_upsert_sql(
