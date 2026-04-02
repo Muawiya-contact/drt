@@ -18,6 +18,7 @@ from jinja2 import Environment, PackageLoader
 
 from drt.config.credentials import (
     BigQueryProfile,
+    ClickHouseProfile,
     DuckDBProfile,
     PostgresProfile,
     ProfileConfig,
@@ -31,7 +32,7 @@ from drt.config.credentials import (
 class InitAnswers:
     project_name: str
     profile_name: str
-    source_type: Literal["bigquery", "duckdb", "sqlite", "postgres", "redshift"]
+    source_type: Literal["bigquery", "duckdb", "sqlite", "postgres", "redshift", "clickhouse"]
     # BigQuery
     gcp_project: str = ""
     dataset: str = ""
@@ -55,6 +56,12 @@ class InitAnswers:
     rs_user: str = ""
     rs_password_env: str = "REDSHIFT_PASSWORD"
     rs_schema: str = "public"
+    # ClickHouse
+    ch_host: str = "localhost"
+    ch_port: int = 8123
+    ch_database: str = "default"
+    ch_user: str = "default"
+    ch_password_env: str = "CLICKHOUSE_PASSWORD"
 
 
 def run_wizard() -> InitAnswers:
@@ -66,11 +73,11 @@ def run_wizard() -> InitAnswers:
     project_name = typer.prompt("  Project name", default=Path.cwd().name)
     profile_name = typer.prompt("  Profile name", default="dev")
     raw_source = typer.prompt(
-        "  Source type [bigquery/duckdb/sqlite/postgres/redshift]",
+        "  Source type [bigquery/duckdb/sqlite/postgres/redshift/clickhouse]",
         default="bigquery",
     )
-    _valid = ("bigquery", "duckdb", "sqlite", "postgres", "redshift")
-    source_type: Literal["bigquery", "duckdb", "sqlite", "postgres", "redshift"] = (
+    _valid = ("bigquery", "duckdb", "sqlite", "postgres", "redshift", "clickhouse")
+    source_type: Literal["bigquery", "duckdb", "sqlite", "postgres", "redshift", "clickhouse"] = (
         raw_source if raw_source in _valid else "bigquery"
     )
 
@@ -129,6 +136,15 @@ def run_wizard() -> InitAnswers:
             "  Env var for password", default="REDSHIFT_PASSWORD"
         )
         answers.rs_schema = typer.prompt("  Schema", default="public")
+
+    elif source_type == "clickhouse":
+        answers.ch_host = typer.prompt("  Host", default="localhost")
+        answers.ch_port = int(typer.prompt("  Port", default="8123"))
+        answers.ch_database = typer.prompt("  Database", default="default")
+        answers.ch_user = typer.prompt("  User", default="default")
+        answers.ch_password_env = typer.prompt(
+            "  Env var for password", default="CLICKHOUSE_PASSWORD"
+        )
 
     typer.echo("")
     return answers
@@ -205,7 +221,7 @@ def scaffold_project(answers: InitAnswers, project_dir: Path) -> list[str]:
             user=answers.pg_user,
             password_env=answers.pg_password_env,
         )
-    else:
+    elif answers.source_type == "redshift":
         profile = RedshiftProfile(
             type="redshift",
             host=answers.rs_host,
@@ -214,6 +230,15 @@ def scaffold_project(answers: InitAnswers, project_dir: Path) -> list[str]:
             user=answers.rs_user,
             password_env=answers.rs_password_env,
             schema=answers.rs_schema,
+        )
+    else:
+        profile = ClickHouseProfile(
+            type="clickhouse",
+            host=answers.ch_host,
+            port=answers.ch_port,
+            database=answers.ch_database,
+            user=answers.ch_user,
+            password_env=answers.ch_password_env,
         )
     profiles_path = save_profile(answers.profile_name, profile)
     created.append(str(profiles_path))

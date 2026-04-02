@@ -196,6 +196,7 @@ Claude Codeの公式スキルをインストールすると、チャットイン
 | **Source** | Snowflake | 🗓 planned | `pip install drt-core[snowflake]` |
 | **Source** | SQLite | ✅ v0.4.2 | (core) |
 | **Source** | Redshift | ✅ v0.3.4 | `pip install drt-core[redshift]` |
+| **Source** | ClickHouse | ✅ v0.4.3 | `pip install drt-core[clickhouse]` |
 | **Source** | MySQL | 🗓 planned | `pip install drt-core[mysql]` |
 | **Destination** | REST API | ✅ v0.1 | (core) |
 | **Destination** | Slack Incoming Webhook | ✅ v0.1 | (core) |

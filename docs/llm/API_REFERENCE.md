@@ -18,7 +18,7 @@ profile: default          # optional, default: "default" — maps to ~/.drt/prof
 
 ```yaml
 default:
-  type: bigquery            # "bigquery" | "duckdb" | "sqlite" | "postgres" | "redshift"
+  type: bigquery            # "bigquery" | "duckdb" | "sqlite" | "postgres" | "redshift" | "clickhouse"
   project: my-gcp-project   # BigQuery: GCP project ID
   dataset: analytics        # BigQuery: dataset name
   location: US              # optional: "US" (default), "EU", "asia-northeast1", etc.
@@ -51,6 +51,15 @@ redshift_prod:
   user: analyst
   password_env: REDSHIFT_PASSWORD
   schema: public          # default: "public"
+
+# ClickHouse example:
+ch_prod:
+  type: clickhouse
+  host: localhost
+  port: 8123              # default: 8123 (HTTP interface)
+  database: default
+  user: default
+  password_env: CLICKHOUSE_PASSWORD
 ```
 
 ---

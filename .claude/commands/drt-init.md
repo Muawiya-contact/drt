@@ -17,7 +17,7 @@ Guide the user through initializing a new drt project.
    ```
    `drt init` will prompt for:
    - Project name
-   - Source type (bigquery / duckdb / postgres / redshift / sqlite)
+   - Source type (bigquery / duckdb / sqlite / postgres / redshift / clickhouse)
    - GCP project + dataset + location (if BigQuery)
    - Auth method (Application Default Credentials or keyfile)
 
