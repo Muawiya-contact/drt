@@ -57,24 +57,29 @@ Check that all documentation and version references are consistent before a drt 
     - `drt/mcp/server.py` tool descriptions are accurate
     - All MCP tools listed in README.md match actual implementations
 
-13. **CI** — verify all tests pass: `make test && make lint`
+13. **GitHub Topics** — verify:
+    - New connectors (sources/destinations) are added as topics: `gh api repos/drt-hub/drt/topics`
+    - Max 20 topics — remove outdated ones if needed before adding
+    - Add with: `gh repo edit drt-hub/drt --add-topic <name>`
 
-14. **GitHub Milestone** — verify:
+14. **CI** — verify all tests pass: `make test && make lint`
+
+15. **GitHub Milestone** — verify:
     - All milestone issues are closed or moved
     - No open PRs blocking the release
 
-15. **GitHub Release — drt-core** — create (or verify exists):
+16. **GitHub Release — drt-core** — create (or verify exists):
     - `gh release create v{VERSION}` with title `v{VERSION}`
     - Release notes: "What's New" sections matching CHANGELOG entry
     - Mark as `--latest` for the primary release
     - Include `Full Changelog` compare link
 
-16. **GitHub Release — dagster-drt** (if version bumped) — create (or verify exists):
+17. **GitHub Release — dagster-drt** (if version bumped) — create (or verify exists):
     - `gh release create dagster-drt-v{VERSION} --latest=false` with title `dagster-drt v{VERSION}`
     - Release notes: features, requirements, PyPI link
     - **MUST pass `--latest=false`** (gh defaults to auto-detect by date, which will steal Latest from drt-core)
 
-17. **Verify Latest flag** — after all releases are created:
+18. **Verify Latest flag** — after all releases are created:
     - `gh release list --limit 5` — confirm drt-core `v{VERSION}` shows `Latest`, dagster-drt does not
     - If wrong: `gh release edit dagster-drt-v{VERSION} --latest=false && gh release edit v{VERSION} --latest`
 
