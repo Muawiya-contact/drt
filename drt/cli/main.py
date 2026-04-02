@@ -14,6 +14,7 @@ if TYPE_CHECKING:
         DuckDBProfile,
         PostgresProfile,
         RedshiftProfile,
+        SQLiteProfile,
     )
     from drt.config.models import SyncConfig
     from drt.destinations.github_actions import GitHubActionsDestination
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
     from drt.sources.duckdb import DuckDBSource
     from drt.sources.postgres import PostgresSource
     from drt.sources.redshift import RedshiftSource
+    from drt.sources.sqlite import SQLiteSource
 
 from drt import __version__
 from drt.cli.output import (
@@ -255,22 +257,26 @@ def mcp_run() -> None:
 
 
 def _get_source(
-    profile: BigQueryProfile | DuckDBProfile | PostgresProfile | RedshiftProfile,
-) -> BigQuerySource | DuckDBSource | PostgresSource | RedshiftSource:
+    profile: BigQueryProfile | DuckDBProfile | SQLiteProfile | PostgresProfile | RedshiftProfile,
+) -> BigQuerySource | DuckDBSource | SQLiteSource | PostgresSource | RedshiftSource:
     from drt.config.credentials import (
         BigQueryProfile,
         DuckDBProfile,
         PostgresProfile,
         RedshiftProfile,
+        SQLiteProfile,
     )
     from drt.sources.bigquery import BigQuerySource
     from drt.sources.duckdb import DuckDBSource
     from drt.sources.postgres import PostgresSource
+    from drt.sources.sqlite import SQLiteSource
 
     if isinstance(profile, BigQueryProfile):
         return BigQuerySource()
     if isinstance(profile, DuckDBProfile):
         return DuckDBSource()
+    if isinstance(profile, SQLiteProfile):
+        return SQLiteSource()
     if isinstance(profile, PostgresProfile):
         return PostgresSource()
     if isinstance(profile, RedshiftProfile):
