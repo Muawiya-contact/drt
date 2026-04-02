@@ -57,8 +57,8 @@ class DuckDBProfile:
 class SQLiteProfile:
     type: Literal["sqlite"]
     database: str = ":memory:"  # path or :memory:
-    
-       
+
+
 @dataclass
 class PostgresProfile:
     type: Literal["postgres"]
