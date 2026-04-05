@@ -39,7 +39,6 @@ To run on all files manually:
 pre-commit run --all-files
 ```
 
-
 **With pip:**
 
 ```bash
