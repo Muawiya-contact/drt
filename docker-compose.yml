@@ -1,0 +1,10 @@
+services:
+  drt:
+    build:
+      context: .
+      args:
+        DRT_EXTRAS: "postgres"
+    volumes:
+      - ${HOME}/.drt/profiles.yml:/home/drt/.drt/profiles.yml:ro
+      - ./:/app
+    command: ["run"]
