@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from drt.destinations.google_sheets import GoogleSheetsDestination
     from drt.destinations.hubspot import HubSpotDestination
     from drt.destinations.mysql import MySQLDestination
+    from drt.destinations.parquet import ParquetDestination
     from drt.destinations.postgres import PostgresDestination
     from drt.destinations.rest_api import RestApiDestination
     from drt.destinations.slack import SlackDestination
@@ -328,6 +329,7 @@ def _get_destination(
     | GoogleSheetsDestination
     | PostgresDestination
     | MySQLDestination
+    | ParquetDestination
 ):
     from drt.config.models import (
         DiscordDestinationConfig,
@@ -335,6 +337,7 @@ def _get_destination(
         GoogleSheetsDestinationConfig,
         HubSpotDestinationConfig,
         MySQLDestinationConfig,
+        ParquetDestinationConfig,
         PostgresDestinationConfig,
         RestApiDestinationConfig,
         SlackDestinationConfig,
@@ -366,4 +369,8 @@ def _get_destination(
         return PostgresDestination()
     if isinstance(dest, MySQLDestinationConfig):
         return MySQLDestination()
+    if isinstance(dest, ParquetDestinationConfig):
+        from drt.destinations.parquet import ParquetDestination
+
+        return ParquetDestination()
     raise ValueError(f"Unsupported destination type: {dest.type}")

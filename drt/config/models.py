@@ -191,6 +191,13 @@ class MySQLDestinationConfig(BaseModel):
         return self
 
 
+class ParquetDestinationConfig(BaseModel):
+    type: Literal["parquet"]
+    path: str  # output file or directory path, e.g. "output/data.parquet"
+    partition_by: list[str] | None = None  # optional partition columns
+    compression: Literal["snappy", "gzip", "zstd", "none"] = "snappy"
+
+
 # Discriminated union — add new destination types here
 DestinationConfig = Annotated[
     RestApiDestinationConfig
@@ -200,7 +207,8 @@ DestinationConfig = Annotated[
     | HubSpotDestinationConfig
     | GoogleSheetsDestinationConfig
     | PostgresDestinationConfig
-    | MySQLDestinationConfig,
+    | MySQLDestinationConfig
+    | ParquetDestinationConfig,
     Field(discriminator="type"),
 ]
 
