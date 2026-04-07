@@ -131,14 +131,16 @@ drt --show-completion       # show completion script
 Shell completion is supported for bash, zsh, and fish:
 
 ```bash
-# Install completion for your current shell
+# Recommended: auto-install for your current shell (idempotent)
 drt --install-completion
 
-# Or manually add to your shell config
+# Or manually add to your shell config (run once from the target shell)
 drt --show-completion >> ~/.bashrc   # bash
 drt --show-completion >> ~/.zshrc    # zsh
 drt --show-completion > ~/.config/fish/completions/drt.fish  # fish
 ```
+
+> **Note:** `--show-completion` outputs the script for your *current* shell. Run it from the shell you want to configure. The manual `>>` append is not idempotent — run it once only.
 
 After installation, restart your shell and tab-complete commands and options.
 
