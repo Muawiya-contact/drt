@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from drt.destinations.parquet import ParquetDestination
     from drt.destinations.postgres import PostgresDestination
     from drt.destinations.rest_api import RestApiDestination
+    from drt.destinations.sendgrid import SendGridDestination
     from drt.destinations.slack import SlackDestination
     from drt.destinations.teams import TeamsDestination
     from drt.sources.bigquery import BigQuerySource
@@ -503,6 +504,7 @@ def _get_destination(
     | GitHubActionsDestination
     | HubSpotDestination
     | JiraDestination
+    | SendGridDestination
     | GoogleSheetsDestination
     | PostgresDestination
     | MySQLDestination
@@ -523,6 +525,7 @@ def _get_destination(
         ParquetDestinationConfig,
         PostgresDestinationConfig,
         RestApiDestinationConfig,
+        SendGridDestinationConfig,
         SlackDestinationConfig,
         TeamsDestinationConfig,
     )
@@ -534,6 +537,7 @@ def _get_destination(
     from drt.destinations.mysql import MySQLDestination
     from drt.destinations.postgres import PostgresDestination
     from drt.destinations.rest_api import RestApiDestination
+    from drt.destinations.sendgrid import SendGridDestination
     from drt.destinations.slack import SlackDestination
 
     dest = sync.destination
@@ -549,6 +553,8 @@ def _get_destination(
         return HubSpotDestination()
     if isinstance(dest, JiraDestinationConfig):
         return JiraDestination()
+    if isinstance(dest, SendGridDestinationConfig):
+        return SendGridDestination()
     if isinstance(dest, GoogleSheetsDestinationConfig):
         from drt.destinations.google_sheets import GoogleSheetsDestination
 

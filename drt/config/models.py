@@ -146,6 +146,20 @@ class HubSpotDestinationConfig(BaseModel):
         return f"{self.type} ({self.object_type})"
 
 
+class SendGridDestinationConfig(BaseModel):
+    type: Literal["sendgrid"]
+    from_email: str
+    from_name: str | None = None
+    subject_template: str
+    body_template: str
+    to_email_field: str = "email"
+    list_ids: list[str] | None = None
+    auth: BearerAuth = Field(default_factory=lambda: BearerAuth(type="bearer"))
+
+    def describe(self) -> str:
+        return f"sendgrid ({self.from_email})"
+
+
 class SslConfig(BaseModel):
     """SSL/TLS connection options for DB destinations."""
 
@@ -302,6 +316,7 @@ DestinationConfig = Annotated[
     | DiscordDestinationConfig
     | GitHubActionsDestinationConfig
     | HubSpotDestinationConfig
+    | SendGridDestinationConfig
     | GoogleSheetsDestinationConfig
     | PostgresDestinationConfig
     | MySQLDestinationConfig
