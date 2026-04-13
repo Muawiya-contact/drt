@@ -333,6 +333,78 @@ destination:
 > Uses `INSERT ... ON DUPLICATE KEY UPDATE ...` for idempotent writes.
 > `connection_string_env` takes precedence over individual parameters when both are set.
 
+### `type: clickhouse` (destination)
+
+```yaml
+destination:
+  type: clickhouse
+  host: localhost                      # or host_env
+  port: 8123                           # default: 8123 (HTTP)
+  database: default                    # required
+  user: default                        # or user_env
+  password_env: CH_PASSWORD            # env var for password
+  table: analytics.scores             # required: target table
+  upsert_key: [id]                     # optional: deduplication via ReplacingMergeTree
+  secure: false                        # true = HTTPS
+  connection_string_env: CH_CONN       # alternative: full connection string
+```
+
+### `type: teams`
+
+```yaml
+destination:
+  type: teams
+  webhook_url_env: TEAMS_WEBHOOK_URL   # env var for Incoming Webhook URL
+  message_template: "New alert: {{ row.message }}"  # Jinja2 plain text
+  adaptive_card: false                 # true = message_template is Adaptive Card JSON
+```
+
+### `type: parquet`
+
+```yaml
+destination:
+  type: parquet
+  path: output/data.parquet            # required: output file path
+  compression: snappy                  # "snappy" (default) | "gzip" | "zstd" | "none"
+  partition_by: [region, date]         # optional: partition columns
+```
+
+> Requires: `pip install drt-core[parquet]`
+
+### `type: file`
+
+```yaml
+destination:
+  type: file
+  path: output/data.csv               # required: output file path
+  format: csv                          # "csv" | "json" | "jsonl"
+```
+
+> No extra dependencies — uses stdlib csv and json.
+
+### `type: linear`
+
+```yaml
+destination:
+  type: linear
+  token_env: LINEAR_API_KEY            # env var for Linear API key
+  team_id: "TEAM-ID"                   # required: Linear team ID
+  title_template: "{{ row.title }}"    # Jinja2 template for issue title
+  description_template: "{{ row.body }}"  # Jinja2 template for description
+```
+
+### `type: sendgrid`
+
+```yaml
+destination:
+  type: sendgrid
+  api_key_env: SENDGRID_API_KEY        # env var for SendGrid API key
+  from_email: alerts@example.com       # required: sender email
+  to_field: email                      # row field for recipient email
+  subject_template: "Alert: {{ row.title }}"  # Jinja2 template
+  body_template: "{{ row.message }}"   # Jinja2 template for email body
+```
+
 ---
 
 ## Auth Configs

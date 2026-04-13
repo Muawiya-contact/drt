@@ -198,24 +198,28 @@ Claude Codeの公式スキルをインストールすると、チャットイン
 | **Source** | BigQuery | ✅ v0.1 | `pip install drt-core[bigquery]` |
 | **Source** | DuckDB | ✅ v0.1 | (core) |
 | **Source** | PostgreSQL | ✅ v0.1 | `pip install drt-core[postgres]` |
-| **Source** | Snowflake | 🗓 planned | `pip install drt-core[snowflake]` |
+| **Source** | Snowflake | ✅ v0.5 | `pip install drt-core[snowflake]` |
 | **Source** | SQLite | ✅ v0.4.2 | (core) |
 | **Source** | Redshift | ✅ v0.3.4 | `pip install drt-core[redshift]` |
 | **Source** | ClickHouse | ✅ v0.4.3 | `pip install drt-core[clickhouse]` |
-| **Source** | MySQL | 🗓 planned | `pip install drt-core[mysql]` |
+| **Source** | MySQL | ✅ v0.5 | `pip install drt-core[mysql]` |
 | **Destination** | REST API | ✅ v0.1 | (core) |
 | **Destination** | Slack Incoming Webhook | ✅ v0.1 | (core) |
 | **Destination** | Discord Webhook | ✅ v0.4.2 | (core) |
+| **Destination** | Microsoft Teams Webhook | ✅ v0.5 | (core) |
 | **Destination** | GitHub Actions (workflow_dispatch) | ✅ v0.1 | (core) |
 | **Destination** | HubSpot (Contacts / Deals / Companies) | ✅ v0.1 | (core) |
 | **Destination** | Google Sheets | ✅ v0.4 | `pip install drt-core[sheets]` |
 | **Destination** | PostgreSQL (upsert) | ✅ v0.4 | `pip install drt-core[postgres]` |
 | **Destination** | MySQL (upsert) | ✅ v0.4 | `pip install drt-core[mysql]` |
-| **Destination** | CSV / JSON file | 🗓 v0.5 | (core) |
+| **Destination** | ClickHouse | ✅ v0.5 | `pip install drt-core[clickhouse]` |
+| **Destination** | Parquet file | ✅ v0.5 | `pip install drt-core[parquet]` |
+| **Destination** | CSV / JSON / JSONL file | ✅ v0.5 | (core) |
+| **Destination** | Jira | ✅ v0.5 | (core) |
+| **Destination** | Linear | ✅ v0.5 | (core) |
+| **Destination** | SendGrid | ✅ v0.5 | (core) |
 | **Destination** | Salesforce | 🗓 v0.6 | `pip install drt-core[salesforce]` |
 | **Destination** | Notion | 🗓 planned | (core) |
-| **Destination** | Linear | 🗓 planned | (core) |
-| **Destination** | SendGrid | 🗓 planned | (core) |
 | **Integration** | Dagster | ✅ v0.4 | `pip install dagster-drt` |
 | **Integration** | Airflow | 🗓 v0.6 | `pip install airflow-drt` |
 | **Integration** | dbt manifest reader | ✅ v0.4 | (core) |
@@ -233,8 +237,8 @@ Claude Codeの公式スキルをインストールすると、チャットイン
 | **v0.2** ✅ | Incremental sync (`cursor_field` watermark) · retry config per-sync |
 | **v0.3** ✅ | MCP Server (`drt mcp run`) · AI Skills for Claude Code · LLM-readable docs · row-level errors · security hardening · Redshift source |
 | **v0.4** ✅ | Google Sheets / PostgreSQL / MySQL destinations · dagster-drt · dbt manifest reader · type safety overhaul |
-| [v0.5](https://github.com/drt-hub/drt/milestone/2) | Snowflake source · CSV/JSON + Parquet destinations · test coverage · Docker |
-| [v0.6](https://github.com/drt-hub/drt/milestone/3) | Salesforce · Airflow integration · Jira / Twilio / Intercom destinations |
+| **v0.5** ✅ | Snowflake / MySQL sources · ClickHouse / Parquet / Teams / CSV+JSON / Jira / Linear / SendGrid destinations · `drt test` · `--output json` · `--profile` · Docker |
+| [v0.6](https://github.com/drt-hub/drt/milestone/3) | Salesforce · Airflow integration · Twilio / Intercom destinations |
 | [v0.7](https://github.com/drt-hub/drt/milestone/4) | DWH destinations (Snowflake / BigQuery / ClickHouse / Databricks) · Cloud storage (S3 / GCS / Azure Blob) |
 | [v0.8](https://github.com/drt-hub/drt/milestone/5) | Lakehouse sources (Delta Lake / Apache Iceberg) |
 | v1.x | Rust engine (PyO3) |

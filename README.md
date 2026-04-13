@@ -118,9 +118,13 @@ drt run                     # run all syncs
 drt run --select <name>     # run a specific sync
 drt run --dry-run           # dry run
 drt run --verbose           # show row-level error details
+drt run --output json       # structured JSON output for CI/scripting
+drt run --profile prd       # override profile (or DRT_PROFILE env var)
+drt test                    # run post-sync validation tests
+drt test --select <name>    # test a specific sync
 drt validate                # validate sync YAML configs
 drt status                  # show recent sync status
-drt status --verbose        # show per-row error details
+drt status --output json    # JSON output for status
 drt mcp run                 # start MCP server (requires drt-core[mcp])
 drt --install-completion    # install shell completion (bash/zsh/fish)
 drt --show-completion       # show completion script
@@ -214,11 +218,11 @@ Copy the files from `.claude/commands/` into your drt project's `.claude/command
 | **Source** | BigQuery | ✅ v0.1 | `pip install drt-core[bigquery]` |
 | **Source** | DuckDB | ✅ v0.1 | (core) |
 | **Source** | PostgreSQL | ✅ v0.1 | `pip install drt-core[postgres]` |
-| **Source** | Snowflake | 🗓 planned | `pip install drt-core[snowflake]` |
+| **Source** | Snowflake | ✅ v0.5 | `pip install drt-core[snowflake]` |
 | **Source** | SQLite | ✅ v0.4.2 | (core) |
 | **Source** | Redshift | ✅ v0.3.4 | `pip install drt-core[redshift]` |
 | **Source** | ClickHouse | ✅ v0.4.3 | `pip install drt-core[clickhouse]` |
-| **Source** | MySQL | 🗓 planned | `pip install drt-core[mysql]` |
+| **Source** | MySQL | ✅ v0.5 | `pip install drt-core[mysql]` |
 | **Destination** | REST API | ✅ v0.1 | (core) |
 | **Destination** | Slack Incoming Webhook | ✅ v0.1 | (core) |
 | **Destination** | Discord Webhook | ✅ v0.4.2 | (core) |
@@ -231,10 +235,11 @@ Copy the files from `.claude/commands/` into your drt project's `.claude/command
 | **Destination** | Parquet file | ✅ v0.5 | `pip install drt-core[parquet]` |
 | **Destination** | Microsoft Teams Webhook | ✅ v0.5 | (core) |
 | **Destination** | CSV / JSON / JSONL file | ✅ v0.5 | (core) |
+| **Destination** | Jira | ✅ v0.5 | (core) |
+| **Destination** | Linear | ✅ v0.5 | (core) |
+| **Destination** | SendGrid | ✅ v0.5 | (core) |
 | **Destination** | Salesforce | 🗓 v0.6 | `pip install drt-core[salesforce]` |
 | **Destination** | Notion | 🗓 planned | (core) |
-| **Destination** | Linear | 🗓 planned | (core) |
-| **Destination** | SendGrid | 🗓 planned | (core) |
 | **Integration** | Dagster | ✅ v0.4 | `pip install dagster-drt` |
 | **Integration** | Airflow | 🗓 v0.6 | `pip install airflow-drt` |
 | **Integration** | dbt manifest reader | ✅ v0.4 | (core) |
@@ -252,8 +257,8 @@ Copy the files from `.claude/commands/` into your drt project's `.claude/command
 | **v0.2** ✅ | Incremental sync (`cursor_field` watermark) · retry config per-sync |
 | **v0.3** ✅ | MCP Server (`drt mcp run`) · AI Skills for Claude Code · LLM-readable docs · row-level errors · security hardening · Redshift source |
 | **v0.4** ✅ | Google Sheets / PostgreSQL / MySQL destinations · dagster-drt · dbt manifest reader · type safety overhaul |
-| [v0.5](https://github.com/drt-hub/drt/milestone/2) | Snowflake source · ClickHouse / Parquet / Teams / CSV+JSON destinations · Docker · test coverage |
-| [v0.6](https://github.com/drt-hub/drt/milestone/3) | Salesforce · Airflow integration · Jira / Twilio / Intercom destinations |
+| **v0.5** ✅ | Snowflake / MySQL sources · ClickHouse / Parquet / Teams / CSV+JSON / Jira / Linear / SendGrid destinations · `drt test` · `--output json` · `--profile` · `${VAR}` substitution · dbt manifest · secrets.toml · Docker |
+| [v0.6](https://github.com/drt-hub/drt/milestone/3) | Salesforce · Airflow integration · Twilio / Intercom destinations |
 | [v0.7](https://github.com/drt-hub/drt/milestone/4) | DWH destinations (Snowflake / BigQuery / ClickHouse / Databricks) · Cloud storage (S3 / GCS / Azure Blob) |
 | [v0.8](https://github.com/drt-hub/drt/milestone/5) | Lakehouse sources (Delta Lake / Apache Iceberg) |
 | v1.x | Rust engine (PyO3) |
