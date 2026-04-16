@@ -418,9 +418,38 @@ class RetryConfig(BaseModel):
     retryable_status_codes: tuple[int, ...] = (429, 500, 502, 503, 504)
 
 
+class WatermarkConfig(BaseModel):
+    """Configuration for remote watermark storage."""
+
+    storage: Literal["local", "gcs", "bigquery"] = "local"
+    # GCS
+    bucket: str | None = None
+    key: str | None = None
+    # BigQuery
+    project: str | None = None
+    dataset: str | None = None
+
+    @model_validator(mode="after")
+    def _check_backend_fields(self) -> "WatermarkConfig":
+        if self.storage == "gcs" and not self.bucket:
+            raise ValueError("watermark.bucket is required when storage is 'gcs'.")
+        if self.storage == "gcs" and not self.key:
+            raise ValueError("watermark.key is required when storage is 'gcs'.")
+        if self.storage == "bigquery" and not self.project:
+            raise ValueError(
+                "watermark.project is required when storage is 'bigquery'."
+            )
+        if self.storage == "bigquery" and not self.dataset:
+            raise ValueError(
+                "watermark.dataset is required when storage is 'bigquery'."
+            )
+        return self
+
+
 class SyncOptions(BaseModel):
     mode: Literal["full", "incremental", "upsert", "replace"] = "full"
     cursor_field: str | None = None  # required when mode=incremental
+    watermark: WatermarkConfig | None = None
     batch_size: int = 100
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
     retry: RetryConfig = Field(default_factory=RetryConfig)

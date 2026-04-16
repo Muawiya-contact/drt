@@ -276,6 +276,50 @@ def test_sync_options_replace_in_sync_config() -> None:
     assert cfg.sync.mode == "replace"
 
 
+def test_watermark_config_gcs() -> None:
+    opts = SyncOptions(
+        mode="incremental",
+        cursor_field="updated_at",
+        watermark={
+            "storage": "gcs",
+            "bucket": "my-bucket",
+            "key": "wm/sync.json",
+        },
+    )
+    assert opts.watermark is not None
+    assert opts.watermark.storage == "gcs"
+    assert opts.watermark.bucket == "my-bucket"
+
+
+def test_watermark_config_bigquery() -> None:
+    opts = SyncOptions(
+        mode="incremental",
+        cursor_field="updated_at",
+        watermark={
+            "storage": "bigquery",
+            "project": "my-proj",
+            "dataset": "my_ds",
+        },
+    )
+    assert opts.watermark is not None
+    assert opts.watermark.storage == "bigquery"
+
+
+def test_watermark_config_local_default() -> None:
+    opts = SyncOptions(
+        mode="incremental",
+        cursor_field="updated_at",
+        watermark={"storage": "local"},
+    )
+    assert opts.watermark is not None
+    assert opts.watermark.storage == "local"
+
+
+def test_watermark_config_none_by_default() -> None:
+    opts = SyncOptions(mode="full")
+    assert opts.watermark is None
+
+
 def test_ssl_config_defaults() -> None:
     ssl = SslConfig()
     assert ssl.enabled is False
