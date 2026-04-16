@@ -48,3 +48,49 @@ class LocalWatermarkStorage:
         data = self._load()
         data[sync_name] = value
         self._save_all(data)
+
+
+def _gcs_client() -> Any:
+    """Lazy GCS client — import only when needed."""
+    try:
+        from google.cloud import storage  # type: ignore[import-untyped]
+    except ImportError as e:
+        raise ImportError(
+            "GCS watermark storage requires: pip install drt-core[gcs]"
+        ) from e
+    return storage.Client()
+
+
+class GCSWatermarkStorage:
+    """Google Cloud Storage watermark backend.
+
+    Stores watermarks as a JSON object in a single GCS blob.
+    """
+
+    def __init__(self, bucket: str, key: str) -> None:
+        self._bucket_name = bucket
+        self._key = key
+
+    def _blob(self) -> Any:
+        client = _gcs_client()
+        return client.bucket(self._bucket_name).blob(self._key)
+
+    def _load(self) -> dict[str, str]:
+        blob = self._blob()
+        if not blob.exists():
+            return {}
+        try:
+            data: dict[str, str] = json.loads(blob.download_as_text())
+            return data
+        except (json.JSONDecodeError, ValueError):
+            return {}
+
+    def get(self, sync_name: str) -> str | None:
+        return self._load().get(sync_name)
+
+    def save(self, sync_name: str, value: str) -> None:
+        data = self._load()
+        data[sync_name] = value
+        self._blob().upload_from_string(
+            json.dumps(data, indent=2), content_type="application/json",
+        )
