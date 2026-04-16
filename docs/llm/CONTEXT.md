@@ -204,6 +204,13 @@ Slash command versions also available in `.claude/commands/` for manual installa
 **Upsert mode**: Semantic alias for `mode: full` when `upsert_key` is set. Makes YAML intent explicit.
 - Set `sync.mode: upsert` — behaves identically to `mode: full`
 
+**Replace mode**: TRUNCATE the destination table, then INSERT all rows (full table refresh).
+- Set `sync.mode: replace`
+- `upsert_key` is not required (no conflict resolution needed)
+- Useful for junction/mapping tables where deleted source rows must be removed from destination
+- PostgreSQL/MySQL: wrapped in a transaction for safety
+- ClickHouse: `TRUNCATE TABLE` then INSERT
+
 ### Model Reference
 
 The `model` field in a sync can be:

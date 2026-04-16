@@ -108,7 +108,7 @@ destination:                # required: see Destination Configs below
   # ... destination-specific fields
 
 sync:                       # optional: all fields have defaults
-  mode: full                # "full" (default) | "incremental" | "upsert"  # "upsert" is a semantic alias for "full" when upsert_key is set
+  mode: full                # "full" (default) | "incremental" | "upsert" | "replace"  # "upsert" is alias for "full" when upsert_key is set; "replace" does TRUNCATE + INSERT
   cursor_field: updated_at  # required when mode=incremental — column name for watermark
   batch_size: 100           # default: 100 — rows per destination call
   on_error: fail            # "fail" (default) | "skip"

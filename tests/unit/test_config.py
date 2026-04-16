@@ -254,6 +254,28 @@ def test_sync_options_upsert_in_sync_config() -> None:
     assert cfg.sync.mode == "upsert"
 
 
+def test_sync_options_replace_mode_accepted() -> None:
+    """mode='replace' is valid and does not require cursor_field or upsert_key."""
+    opts = SyncOptions(mode="replace")
+    assert opts.mode == "replace"
+    assert opts.cursor_field is None
+
+
+def test_sync_options_replace_in_sync_config() -> None:
+    """mode='replace' works end-to-end inside a SyncConfig."""
+    raw = {
+        "name": "replace_sync",
+        "model": "ref('sessions')",
+        "destination": {
+            "type": "rest_api",
+            "url": "https://example.com/api",
+        },
+        "sync": {"mode": "replace"},
+    }
+    cfg = SyncConfig(**raw)
+    assert cfg.sync.mode == "replace"
+
+
 def test_ssl_config_defaults() -> None:
     ssl = SslConfig()
     assert ssl.enabled is False

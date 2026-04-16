@@ -64,6 +64,11 @@ def print_dry_run_summary(sync: SyncConfig, profile: ProfileConfig, rows: int) -
     console.print(f"  Destination: {sync.destination.describe()}")
     console.print(f"  Rows to sync: {rows}")
     console.print(f"  Sync mode: {sync.sync.mode}")
+    if sync.sync.mode == "replace":
+        console.print(
+            "  [yellow]⚠ replace mode will TRUNCATE the destination table"
+            " before inserting rows[/yellow]"
+        )
 
 
 def print_sync_result(sync_name: str, result: SyncResult, elapsed: float) -> None:
