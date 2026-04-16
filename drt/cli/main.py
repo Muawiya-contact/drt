@@ -267,11 +267,15 @@ def run(
 
     for sync in syncs:
         dest = _get_destination(sync)
+        wm_storage = _get_watermark_storage(sync, Path("."))
         if not json_mode and not dry_run:
             print_sync_start(sync.name, dry_run)
         t0 = time.monotonic()
         try:
-            result = run_sync(sync, source, dest, profile, Path("."), dry_run, state_mgr)
+            result = run_sync(
+                sync, source, dest, profile, Path("."),
+                dry_run, state_mgr, watermark_storage=wm_storage,
+            )
         except Exception as e:
             elapsed = round(time.monotonic() - t0, 2)
             if json_mode:
@@ -692,6 +696,36 @@ def _get_source(
 
         return SQLServerSource()
     raise ValueError(f"Unsupported source type: {type(profile)}")
+
+
+def _get_watermark_storage(
+    sync: SyncConfig, project_dir: Path,
+) -> "WatermarkStorage | None":
+    """Build watermark storage from sync config, or None if not configured."""
+    from drt.state.watermark import (
+        BigQueryWatermarkStorage,
+        GCSWatermarkStorage,
+        LocalWatermarkStorage,
+        WatermarkStorage,
+    )
+
+    wm = sync.sync.watermark
+    if wm is None:
+        return None
+
+    if wm.storage == "local":
+        return LocalWatermarkStorage(project_dir)
+    elif wm.storage == "gcs":
+        assert wm.bucket is not None
+        assert wm.key is not None
+        return GCSWatermarkStorage(bucket=wm.bucket, key=wm.key)
+    elif wm.storage == "bigquery":
+        assert wm.project is not None
+        assert wm.dataset is not None
+        return BigQueryWatermarkStorage(
+            project=wm.project, dataset=wm.dataset,
+        )
+    return None
 
 
 def _get_destination(
