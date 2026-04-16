@@ -200,6 +200,8 @@ Slash command versions also available in `.claude/commands/` for manual installa
 - drt saves `last_cursor_value` in `.drt/state.json` after each run
 - Next run automatically injects `WHERE <cursor_field> > '<last_value>'`
 - Cursor comparison uses numeric ordering when possible (handles integer/float cursors correctly)
+- **Template variable**: Use `{{ cursor_value }}` (or `{{ watermark }}`) in model SQL for flexible WHERE placement. When present, auto-injection is skipped.
+- **Remote watermark storage**: For stateless environments (e.g., Cloud Run Jobs), set `sync.watermark.storage` to `gcs` or `bigquery` to persist cursor values externally instead of `.drt/state.json`.
 
 **Upsert mode**: Semantic alias for `mode: full` when `upsert_key` is set. Makes YAML intent explicit.
 - Set `sync.mode: upsert` — behaves identically to `mode: full`

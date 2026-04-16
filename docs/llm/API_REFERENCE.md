@@ -110,6 +110,12 @@ destination:                # required: see Destination Configs below
 sync:                       # optional: all fields have defaults
   mode: full                # "full" (default) | "incremental" | "upsert" | "replace"  # "upsert" is alias for "full" when upsert_key is set; "replace" does TRUNCATE + INSERT
   cursor_field: updated_at  # required when mode=incremental — column name for watermark
+  watermark:                # optional: remote watermark storage for stateless environments
+    storage: local          # "local" (default) | "gcs" | "bigquery"
+    bucket: my-bucket       # GCS only
+    key: watermarks/s.json  # GCS only
+    project: my-project     # BigQuery only
+    dataset: my_dataset     # BigQuery only
   batch_size: 100           # default: 100 — rows per destination call
   on_error: fail            # "fail" (default) | "skip"
   rate_limit:
