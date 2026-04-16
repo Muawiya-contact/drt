@@ -79,6 +79,12 @@ def print_sync_result(sync_name: str, result: SyncResult, elapsed: float) -> Non
     else:
         status = "[red]✗[/red]"
 
+    if result.rows_extracted == 0 and result.failed == 0:
+        console.print(
+            f"  {status} 0 rows [dim](no rows)[/dim]  [dim]({elapsed:.1f}s)[/dim]"
+        )
+        return
+
     console.print(
         f"  {status} {result.success} synced"
         + (f", {result.failed} failed" if result.failed else "")

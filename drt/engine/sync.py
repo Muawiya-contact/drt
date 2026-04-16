@@ -90,6 +90,8 @@ def run_sync(
     staged_count = 0
 
     for record_batch in batch(records_iter, sync.sync.batch_size):
+        total_result.rows_extracted += len(record_batch)
+
         # Track max cursor value seen across all batches
         if cursor_field:
             for row in record_batch:

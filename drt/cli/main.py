@@ -306,6 +306,7 @@ def run(
                         if result.success > 0
                         else "failed"
                     ),
+                    "rows_extracted": result.rows_extracted,
                     "rows_synced": result.success,
                     "rows_failed": result.failed,
                     "duration_seconds": elapsed,

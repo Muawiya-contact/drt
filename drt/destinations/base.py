@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 class SyncResult:
     """Result of a single sync batch."""
 
+    rows_extracted: int = 0
     success: int = 0
     failed: int = 0
     skipped: int = 0

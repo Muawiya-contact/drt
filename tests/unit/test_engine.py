@@ -265,6 +265,54 @@ def test_watermark_storage_used_when_configured(tmp_path: Path) -> None:
     assert wm_storage.get("wm_sync") == "2024-01-05"
 
 
+# ---------------------------------------------------------------------------
+# rows_extracted tracking (#342)
+# ---------------------------------------------------------------------------
+
+def test_rows_extracted_counts_source_rows(tmp_path: Path) -> None:
+    rows = [{"id": i} for i in range(5)]
+    source = FakeSource(rows)
+    dest = FakeDestination()
+    sync = _make_sync()
+
+    result = run_sync(sync, source, dest, _make_profile(), tmp_path)
+    assert result.rows_extracted == 5
+
+
+def test_rows_extracted_with_failures(tmp_path: Path) -> None:
+    rows = [{"id": i} for i in range(5)]
+    source = FakeSource(rows)
+    dest = FakeDestination(fail_indices={0, 2})
+    sync = _make_sync(on_error="skip")
+
+    result = run_sync(sync, source, dest, _make_profile(), tmp_path)
+    assert result.rows_extracted == 5
+    assert result.success == 3
+    assert result.failed == 2
+
+
+def test_rows_extracted_zero_rows(tmp_path: Path) -> None:
+    source = FakeSource([])
+    dest = FakeDestination()
+    sync = _make_sync()
+
+    result = run_sync(sync, source, dest, _make_profile(), tmp_path)
+    assert result.rows_extracted == 0
+    assert result.success == 0
+
+
+def test_rows_extracted_dry_run(tmp_path: Path) -> None:
+    rows = [{"id": i} for i in range(3)]
+    source = FakeSource(rows)
+    dest = FakeDestination()
+    sync = _make_sync()
+
+    result = run_sync(
+        sync, source, dest, _make_profile(), tmp_path, dry_run=True,
+    )
+    assert result.rows_extracted == 3
+
+
 def test_full_sync_no_cursor_saved(tmp_path: Path) -> None:
     from drt.state.manager import StateManager
 
