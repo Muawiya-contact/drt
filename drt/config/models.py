@@ -405,6 +405,24 @@ class FileDestinationConfig(BaseModel):
         return f"{self.type} ({self.path})"
 
 
+class EmailSmtpDestinationConfig(BaseModel):
+    type: Literal["email_smtp"] = "email_smtp"
+    host: str
+    port: int = 587
+    sender: str
+    recipients: list[str]
+    subject_template: str
+    body_template: str
+    use_tls: bool = True
+    username: str | None = None
+    username_env: str | None = None
+    password: str | None = None
+    password_env: str | None = None
+
+    def describe(self) -> str:
+        return f"{self.type} ({self.host})"
+
+
 class NotionDestinationConfig(BaseModel):
     type: Literal["notion"]
     database_id: str
@@ -482,6 +500,7 @@ DestinationConfig = Annotated[
     | ParquetDestinationConfig
     | GoogleAdsDestinationConfig
     | FileDestinationConfig
+    | EmailSmtpDestinationConfig
     | NotionDestinationConfig
     | IntercomDestinationConfig
     | StagedUploadDestinationConfig
