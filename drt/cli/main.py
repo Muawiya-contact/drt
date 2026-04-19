@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from drt.destinations.parquet import ParquetDestination
     from drt.destinations.postgres import PostgresDestination
     from drt.destinations.rest_api import RestApiDestination
+    from drt.destinations.salesforce_bulk import SalesforceBulkDestination
     from drt.destinations.sendgrid import SendGridDestination
     from drt.destinations.slack import SlackDestination
     from drt.destinations.staged_upload import StagedUploadDestination
@@ -938,6 +939,7 @@ def _get_destination(
     | StagedUploadDestination
     | IntercomDestination
     | TwilioDestination
+    | SalesforceBulkDestination
 ):
     from drt.config.models import (
         ClickHouseDestinationConfig,

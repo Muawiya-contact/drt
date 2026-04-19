@@ -177,9 +177,11 @@ class SalesforceBulkDestination:
                         )
                     )
 
-        # STEP 9 — return SyncResult
+        # STEP 9 — build result and clear staged records
+        record_count = len(self._records)
+        self._records.clear()
         return SyncResult(
-            rows_extracted=len(self._records),
+            rows_extracted=record_count,
             success=records_processed - records_failed,
             failed=records_failed,
             row_errors=row_errors,
