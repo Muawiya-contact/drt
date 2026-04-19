@@ -458,7 +458,7 @@ def run(
             )
         if not json_mode:
             if dry_run:
-                print_dry_run_summary(sync, profile, result.success)
+                print_dry_run_summary(sync, profile, result.success, dest)
             else:
                 print_sync_result(sync.name, result, elapsed)
         if not json_mode and verbose and result.row_errors:
