@@ -513,6 +513,7 @@ def list_syncs(
 
 @app.command()
 def validate(
+    select: str = typer.Option(None, "--select", "-s", help="Validate a specific sync by name."),
     emit_schema: bool = typer.Option(  # noqa: E501
         False, "--emit-schema", help="Write JSON Schemas to .drt/schemas/."
     ),
@@ -525,6 +526,13 @@ def validate(
     from drt.config.schema import write_schemas
 
     result = load_syncs_safe(Path("."))
+
+    if select:
+        result.syncs = [s for s in result.syncs if s.name == select]
+        result.errors = {k: v for k, v in result.errors.items() if k == select}
+        if not result.syncs and not result.errors:
+            print_error(f"No sync named '{select}' found.")
+            raise typer.Exit(1)
 
     if output == "json":
         print(
