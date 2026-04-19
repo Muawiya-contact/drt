@@ -37,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-04-19
+
 ### Added
 
 - **`drt sources` and `drt destinations` CLI commands** (#223): List available source and destination connectors with descriptions. Rich table formatting for clean terminal output. Foundation for future auto-discovery features.
