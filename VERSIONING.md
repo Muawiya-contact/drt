@@ -17,10 +17,10 @@ A breaking change is anything that requires users to change their code, YAML con
 Removing or renaming methods in:
 - `Source` protocol (e.g., `Source.extract()`)
 - `Destination` protocol (e.g., `Destination.load()`)
-- `StateManager` protocol
+- `StateManager` class
 - Any public class or method imported from `drt.*`
 
-**Example:** Renaming `Destination.load(records, config)` → `Destination.process_records()` requires a MAJOR bump.
+**Example:** Renaming `Destination.load(records, config, sync_options)` → `Destination.process_records()` requires a MAJOR bump.
 
 ### Sync YAML Schema Breaking Changes
 
@@ -40,11 +40,13 @@ Removing or renaming a sync config key that is not already deprecated.
 Removing or changing:
 - Exit codes (e.g., exit 0 for success must stay 0)
 - `--output json` schema format (structure of JSON output)
+- `--log-format json` output format (structure of log output)
 - Required vs optional flags
 
 **Examples that trigger MAJOR:**
 - Changing `drt run` to exit code 1 on dry-run success
 - Changing `--output json` output structure
+- Changing `--log-format json` output structure
 - Removing `--profile` flag
 
 **Examples that do NOT trigger MAJOR:**
@@ -142,6 +144,8 @@ or
 - **YAML:** `incremental.lookback` renamed to `sync.cursor_lookback`
   - Migrate: Update all syncs with find-and-replace
   - Timeline: Announced deprecated in v0.4.0; removed in v0.5.0
+
+For more details, see migration guide: `docs/migration/v0.4-to-v0.5.md`
 ```
 
 ### Migration Guides
@@ -214,16 +218,15 @@ None. This is a safe upgrade.
 - **YAML:** `sync.batch_size` removed; use `sync.batch_config.size`
 - **CLI:** `--legacy-auth` removed; use `DRT_AUTH_TOKEN` environment variable
 
-### Migration Guide
-See [MIGRATION_v0.1_to_v1.0.md](./docs/migration/v0.1-to-v1.0.md)
+Migration guide: See `docs/migration/v0.1-to-v1.0.md`
 ```
 
 ## Policy Enforcement
 
-- **Release checklist:** Before releasing, verify CHANGELOG has "Breaking Changes" section
+- **Release checklist:** Before releasing, manually verify the CHANGELOG includes a "Breaking Changes" section when the release contains breaking changes
 - **PR reviews:** Check CHANGELOG for `[DEPRECATED]` tags if removing features
-- **CI:** `make release-check` validates that breaking changes are properly documented
-- **Docs:** This file is the source of truth for version decisions
+- **CI:** `make release-check` validates release metadata consistency, the presence of a CHANGELOG entry, and required version/documentation references
+- **Docs:** This file is the source of truth for versioning decisions and release documentation expectations
 
 ## Questions?
 

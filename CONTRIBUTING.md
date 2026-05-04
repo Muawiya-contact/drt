@@ -131,7 +131,7 @@ This is to keep momentum, not to gatekeep. If you're unsure, just ask in the iss
 - [ ] Linter passes (`make lint`)
 - [ ] `CHANGELOG.md` updated (if user-facing change)
 - [ ] New connectors include tests under `tests/` and an example under `examples/`
-- [ ] If breaking change: added `[BREAKING]` tag in CHANGELOG and updated `VERSIONING.md` if needed
+- [ ] If breaking change: documented in `CHANGELOG.md` using the format required by `VERSIONING.md`, and updated `VERSIONING.md` if needed
 
 For details on what constitutes a breaking change, see [VERSIONING.md](VERSIONING.md).
 
