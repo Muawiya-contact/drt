@@ -350,3 +350,140 @@ class TestJsonColumns:
         assert _serialize_value(None, "col", ["col"]) is None
 
 
+# ---------------------------------------------------------------------------
+# Replace mode — swap strategy
+# ---------------------------------------------------------------------------
+
+
+class TestMySQLReplaceSwap:
+    @patch("drt.destinations.mysql.MySQLDestination._connect")
+    def test_swap_creates_shadow_then_inserts(self, mock_connect: MagicMock) -> None:
+        conn = _fake_connection()
+        cur = conn.cursor()
+        mock_connect.return_value = conn
+        records = [{"user_id": 1, "company_id": 5, "score": 0.95}]
+
+        dest = MySQLDestination()
+        dest.load(records, _config(), _options(mode="replace", replace_strategy="swap"))
+
+        sqls = [c[0][0] for c in cur.execute.call_args_list]
+        assert any("DROP TABLE IF EXISTS" in s and "__drt_swap" in s for s in sqls)
+        # MySQL: CREATE TABLE ... LIKE ... (NOT "INCLUDING ALL")
+        assert any(
+            "CREATE TABLE" in s and " LIKE " in s and "__drt_swap" in s for s in sqls
+        )
+        assert any("INSERT INTO" in s and "__drt_swap" in s for s in sqls)
+        # No RENAME yet — happens in finalize_sync
+        assert not any("RENAME TABLE" in s for s in sqls)
+
+    @patch("drt.destinations.mysql.MySQLDestination._connect")
+    def test_swap_finalize_atomic_rename(self, mock_connect: MagicMock) -> None:
+        conn = _fake_connection()
+        cur = conn.cursor()
+        mock_connect.return_value = conn
+
+        dest = MySQLDestination()
+        dest.load(
+            [{"user_id": 1, "company_id": 5, "score": 0.95}],
+            _config(),
+            _options(mode="replace", replace_strategy="swap"),
+        )
+        dest.finalize_sync(
+            _config(), _options(mode="replace", replace_strategy="swap")
+        )
+
+        sqls = [c[0][0] for c in cur.execute.call_args_list]
+        # MySQL: a SINGLE atomic multi-table RENAME statement
+        rename_sqls = [s for s in sqls if "RENAME TABLE" in s]
+        assert len(rename_sqls) == 1
+        rename_sql = rename_sqls[0]
+        # Both pairs in one statement, comma-separated
+        assert "__drt_old" in rename_sql
+        assert "__drt_swap" in rename_sql
+        assert "," in rename_sql
+        # Final DROP of old table
+        assert any("DROP TABLE" in s and "__drt_old" in s for s in sqls)
+
+    @patch("drt.destinations.mysql.MySQLDestination._connect")
+    def test_swap_finalize_noop_when_no_swap_in_progress(
+        self, mock_connect: MagicMock
+    ) -> None:
+        dest = MySQLDestination()
+        # finalize_sync without prior swap-mode load is a safe no-op
+        result = dest.finalize_sync(_config(), _options(mode="full"))
+        assert result is None or result.success == 0
+        # Should not have connected
+        mock_connect.assert_not_called()
+
+    @patch("drt.destinations.mysql.MySQLDestination._connect")
+    def test_swap_creates_shadow_only_once_across_batches(
+        self, mock_connect: MagicMock
+    ) -> None:
+        conn = _fake_connection()
+        cur = conn.cursor()
+        mock_connect.return_value = conn
+
+        dest = MySQLDestination()
+        dest.load(
+            [{"user_id": 1, "company_id": 5, "score": 0.5}],
+            _config(),
+            _options(mode="replace", replace_strategy="swap"),
+        )
+        dest.load(
+            [{"user_id": 2, "company_id": 5, "score": 0.9}],
+            _config(),
+            _options(mode="replace", replace_strategy="swap"),
+        )
+
+        sqls = [c[0][0] for c in cur.execute.call_args_list]
+        create_count = sum(
+            1 for s in sqls if "CREATE TABLE" in s and " LIKE " in s
+        )
+        assert create_count == 1
+
+    @patch("drt.destinations.mysql.MySQLDestination._connect")
+    def test_swap_on_error_fail_drops_shadow_and_resets_state(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """Mid-batch failure with on_error=fail must rollback, drop shadow,
+        and reset state so finalize_sync cannot RENAME a partial shadow into
+        the live table.
+        """
+        conn = _fake_connection()
+        cur = conn.cursor()
+        mock_connect.return_value = conn
+
+        insert_call_count = {"n": 0}
+
+        def execute_side_effect(sql: str, *args: Any) -> None:
+            if sql.startswith("INSERT INTO"):
+                insert_call_count["n"] += 1
+                if insert_call_count["n"] == 2:
+                    raise Exception("data too long for column")
+            return None
+
+        cur.execute.side_effect = execute_side_effect
+
+        dest = MySQLDestination()
+        result = dest.load(
+            [
+                {"user_id": 1, "company_id": 5, "score": 0.5},
+                {"user_id": 2, "company_id": 5, "score": 0.9},
+            ],
+            _config(),
+            _options(mode="replace", replace_strategy="swap", on_error="fail"),
+        )
+
+        assert result.failed == 1
+        assert result.success == 1
+        conn.rollback.assert_called()
+        sqls = [c[0][0] for c in cur.execute.call_args_list]
+        drops = [s for s in sqls if "DROP TABLE IF EXISTS" in s and "__drt_swap" in s]
+        assert len(drops) >= 2
+        # State reset → finalize_sync must be a no-op
+        finalize_result = dest.finalize_sync(
+            _config(), _options(mode="replace", replace_strategy="swap")
+        )
+        assert finalize_result is None
+        sqls_after = [c[0][0] for c in cur.execute.call_args_list]
+        assert not any("RENAME TABLE" in s for s in sqls_after)
