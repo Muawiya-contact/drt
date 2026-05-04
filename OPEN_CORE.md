@@ -20,19 +20,22 @@ These features are designed for enterprise deployments but are **not shipped in 
 - **Role-Based Access Control (RBAC)** — permission boundaries, team isolation
 - **Audit logging** — who ran what sync, when, with what results
 - **Plugin system** — extend drt with custom connectors or transformations
-- **Cloud push** — managed hosting, zero-ops deployment
+- **Cloud hosting / drt Cloud** — managed hosting, zero-ops deployment
 
-We provide **interfaces** for these in the OSS repo (see below). Third parties can implement against them. drt itself ships a reference implementation in the enterprise product only.
+We provide **extensibility points** for some of these in the OSS repo (see below). In some cases, OSS includes CLI command stubs or extension interfaces, but not the underlying hosted service or enterprise implementation. Third parties can implement against those extension points; drt ships the official reference implementation in the enterprise product only.
 
 ## What "Interface in OSS" Means
 
-Some features have interfaces (abstract classes, Protocol definitions, config schemas) in the OSS codebase, but **no implementation**. This allows:
+drt-core exposes extension points where you can build and integrate your own code:
 
-- Third-party vendors to build compatible extensions
-- Community members to fork and self-implement if needed
-- Clear extensibility points without bloat
+- **Connectors:** drt/connectors/registry.py provides the connector registry. You can build and register your own source or destination.
+- **Future extension points:** RBAC, audit logging, and plugin management interfaces will be designed for third-party implementation.
+- This allows:
+  - Community members and vendors to build compatible extensions
+  - Clear separation between OSS extensibility and enterprise-hosted distribution
+  - No vendor lock-in on core extension logic
 
-**Example:** The `PluginRegistry` interface exists in drt-core. You can build a plugin. The official plugin system (management UI, hosted plugin marketplace) is enterprise-only.
+**Current state:** Today, you can build custom connectors by extending the registry. Enterprise features like RBAC and plugin management are planned for future OSS interface definitions.
 
 ## How We Decide
 
@@ -57,9 +60,9 @@ Open a [Discussion](https://github.com/drt-hub/drt/discussions) to propose movin
 
 ### Can I self-implement RBAC or audit logging?
 
-**Yes.** The interfaces are in drt-core. Fork the code, build your own implementation, and contribute back if you'd like. No vendor lock-in.
+**Eventually, yes.** Today, RBAC and audit logging interfaces are not yet in drt-core, but we're designing them to be extensible. In the meantime, you can fork the codebase and build your own implementations.
 
-We also welcome community forks and distributions. If you want to ship drt with your own extensions, go for it.
+We welcome community forks and distributions. If you want to ship drt with your own RBAC, audit, or other extensions, you can do that. We're also open to design discussions about the extension points you'd need.
 
 ### What about pricing or licensing terms?
 
