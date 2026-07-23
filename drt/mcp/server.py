@@ -147,7 +147,10 @@ def create_server(project_dir: Path | None = None) -> Any:
             Dict with `status` ("passed" | "failed" | "no_tests" | "no_syncs"),
             and `results` — a list of per-sync result objects, each with:
                 - `sync`: sync name
-                - `tests`: list of {name, passed, value} or {name, passed: false, error}
+                - `tests`: list of {name, passed, value, severity} or
+                  {name, passed: false, error, severity} — severity is
+                  "warn" | "error" (#779); a "warn" failure is reported here
+                  but never flips the top-level `status` to "failed"
                 - `skipped` (optional): true when destination type isn't queryable
                 - `reason` (optional): why the sync was skipped
         """
