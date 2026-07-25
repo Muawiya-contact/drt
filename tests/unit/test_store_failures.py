@@ -432,12 +432,16 @@ def test_store_failures_fetch_error_preserves_failing_verdict(
 def test_store_failures_limit_rejects_non_positive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Exit code 2 is Click's standard UsageError code (a bad --option value
+    rejected before any test ran) — asserted rather than matching the error
+    text, since Typer/Rich renders it as a colorized, word-wrapped panel
+    whose exact line breaks and ANSI codes are platform-dependent (this CI
+    caught the previous text-match version failing on Linux)."""
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(
         app, ["test", "--store-failures", "--store-failures-limit", "0"]
     )
-    assert result.exit_code != 0
-    assert "store-failures-limit" in result.output
+    assert result.exit_code == 2
 
 
 # ---------------------------------------------------------------------------
