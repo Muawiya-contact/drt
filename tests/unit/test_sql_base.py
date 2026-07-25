@@ -104,6 +104,7 @@ def test_dialect_hooks_are_declared() -> None:
         "_load_replace_swap",
         "_load_replace",
         "_load_upsert",
+        "_build_mirror_delete",
     ):
         assert hasattr(BaseSqlDestination, hook), hook
 
@@ -132,8 +133,8 @@ def test_base_load_hooks_raise_not_implemented() -> None:
 
 
 def test_base_finalize_hooks_raise_not_implemented() -> None:
-    # The swap-rename + shadow/old naming hooks and the mirror-delete hook
-    # (pulled up in phase 2b) are abstract by contract.
+    # The swap-rename + shadow/old naming hooks and the mirror-DELETE builder
+    # (the phase-2b placeholder-expansion seam) are abstract by contract.
     base = BaseSqlDestination()
     with pytest.raises(NotImplementedError):
         base._rename_swap(None, None, "t", "s", "o")
@@ -142,7 +143,23 @@ def test_base_finalize_hooks_raise_not_implemented() -> None:
     with pytest.raises(NotImplementedError):
         base._old_name("t")
     with pytest.raises(NotImplementedError):
-        base._finalize_mirror(object(), SimpleNamespace(mode="mirror"))
+        base._build_mirror_delete("t", ["id"], [(1,)])
+
+
+def test_base_tracked_state_hooks_raise_not_implemented() -> None:
+    # The tracked-mirror state-table hooks (#686 / #695) are abstract by
+    # contract: identifier derivation, existence probe, DDL, and the
+    # template→executable translation each carry a dialect (psycopg2
+    # ``Composed`` vs plain ``str``).
+    base = BaseSqlDestination()
+    with pytest.raises(NotImplementedError):
+        base._state_table_ident(object())
+    with pytest.raises(NotImplementedError):
+        base._state_table_exists(None, None, "_drt_synced_keys")
+    with pytest.raises(NotImplementedError):
+        base._create_state_table(None, "x")
+    with pytest.raises(NotImplementedError):
+        base._state_sql("SELECT 1 FROM {}", "x")
 
 
 # ---------------------------------------------------------------------------
@@ -415,3 +432,359 @@ def test_finalize_sync_swap_delegates_rename_and_resets() -> None:
     ]
     assert d._swap_shadow_created is False
     assert d._swap_table is None
+
+
+# ---------------------------------------------------------------------------
+# _finalize_mirror template (#719 phase 2b)
+# ---------------------------------------------------------------------------
+
+
+def _mirror_dest(events: list[str], tracked_result: Any = None) -> Any:
+    """A BaseSqlDestination subclass recording the mirror-DELETE hook calls.
+
+    ``_build_mirror_delete`` is the dialect seam (PG returns
+    ``(Composed, tuple)``, MySQL ``(str, list)``); here it just echoes its
+    arguments so the base control flow can be asserted dialect-free.
+    """
+
+    class _Cur:
+        def execute(self, stmt: Any, params: Any = None) -> None:
+            events.append(f"execute:{stmt}:{params}")
+
+    class _Conn:
+        def cursor(self) -> _Cur:
+            return _Cur()
+
+        def commit(self) -> None:
+            events.append("commit")
+
+        def close(self) -> None:
+            events.append("close")
+
+    class _Dest(BaseSqlDestination):
+        def _dialect_connect(self, config: Any) -> Any:
+            events.append("connect")
+            return _Conn()
+
+        def _build_mirror_delete(
+            self,
+            table: str,
+            upsert_cols: list[str],
+            keys: list[tuple[Any, ...]],
+            scope_cols: list[str] | None = None,
+            scopes: list[tuple[Any, ...]] | None = None,
+            negate: bool = True,
+        ) -> tuple[Any, Any]:
+            return (
+                f"DELETE {table} {upsert_cols} scope={scope_cols} negate={negate}",
+                (sorted(keys), scopes),
+            )
+
+        def _finalize_mirror_tracked(
+            self, config: Any, sync_options: Any
+        ) -> SyncResult | None:
+            events.append("tracked")
+            return tracked_result
+
+    return _Dest()
+
+
+def test_finalize_mirror_returns_none_without_keys() -> None:
+    events: list[str] = []
+    d = _mirror_dest(events)
+    cfg = SimpleNamespace(table="t", upsert_key=["id"])
+    # never engaged (None) and engaged-but-empty both skip the DELETE
+    assert d._finalize_mirror(cfg, _mirror()) is None
+    d._mirror_keys = []
+    assert d._finalize_mirror(cfg, _mirror()) is None
+    assert events == []
+
+
+def test_finalize_mirror_dispatches_tracked_strategy() -> None:
+    events: list[str] = []
+    sentinel = SyncResult()
+    d = _mirror_dest(events, tracked_result=sentinel)
+    d._mirror_keys = [(1,)]
+    opts = SimpleNamespace(
+        mode="mirror", mirror=SimpleNamespace(scope=None, strategy="tracked")
+    )
+    assert d._finalize_mirror(SimpleNamespace(table="t", upsert_key=["id"]), opts) is (
+        sentinel
+    )
+    assert events == ["tracked"]
+
+
+def test_finalize_mirror_dedupes_keys_and_executes_delete() -> None:
+    events: list[str] = []
+    d = _mirror_dest(events)
+    d._mirror_keys = [(1,), (2,), (1,)]
+    opts = SimpleNamespace(
+        mode="mirror", mirror=SimpleNamespace(scope=None, strategy="destination")
+    )
+    result = d._finalize_mirror(SimpleNamespace(table="t", upsert_key=["id"]), opts)
+    assert isinstance(result, SyncResult)
+    assert events == [
+        "connect",
+        "execute:DELETE t ['id'] scope=None negate=True:([(1,), (2,)], None)",
+        "commit",
+        "close",
+    ]
+
+
+def test_finalize_mirror_passes_scope_cols_and_scopes() -> None:
+    events: list[str] = []
+    d = _mirror_dest(events)
+    d._mirror_keys = [(1,)]
+    d._mirror_scopes = {("a",)}
+    opts = SimpleNamespace(
+        mode="mirror",
+        mirror=SimpleNamespace(scope=["tenant_id"], strategy="destination"),
+    )
+    d._finalize_mirror(SimpleNamespace(table="t", upsert_key=["id"]), opts)
+    assert events == [
+        "connect",
+        "execute:DELETE t ['id'] scope=['tenant_id'] negate=True:([(1,)], [('a',)])",
+        "commit",
+        "close",
+    ]
+
+
+def test_finalize_mirror_no_mirror_options_means_no_scope() -> None:
+    events: list[str] = []
+    d = _mirror_dest(events)
+    d._mirror_keys = [(1,)]
+    opts = SimpleNamespace(mode="mirror", mirror=None)
+    d._finalize_mirror(SimpleNamespace(table="t", upsert_key=["id"]), opts)
+    assert "scope=None" in events[1]
+
+
+def test_finalize_mirror_closes_connection_when_execute_raises() -> None:
+    events: list[str] = []
+
+    class _Cur:
+        def execute(self, stmt: Any, params: Any = None) -> None:
+            raise RuntimeError("boom")
+
+    class _Conn:
+        def cursor(self) -> _Cur:
+            return _Cur()
+
+        def commit(self) -> None:
+            events.append("commit")
+
+        def close(self) -> None:
+            events.append("close")
+
+    class _Dest(BaseSqlDestination):
+        def _dialect_connect(self, config: Any) -> Any:
+            return _Conn()
+
+        def _build_mirror_delete(
+            self,
+            table: str,
+            upsert_cols: list[str],
+            keys: list[tuple[Any, ...]],
+            scope_cols: list[str] | None = None,
+            scopes: list[tuple[Any, ...]] | None = None,
+            negate: bool = True,
+        ) -> tuple[Any, Any]:
+            return ("DELETE", ())
+
+    d = _Dest()
+    d._mirror_keys = [(1,)]
+    with pytest.raises(RuntimeError):
+        d._finalize_mirror(
+            SimpleNamespace(table="t", upsert_key=["id"]),
+            SimpleNamespace(mode="mirror", mirror=None),
+        )
+    assert events == ["close"]
+
+
+# ---------------------------------------------------------------------------
+# _finalize_mirror_tracked template (#719 phase 2b / #686)
+# ---------------------------------------------------------------------------
+
+
+def _tracked_dest(
+    events: list[str],
+    previous: list[tuple[str, str]] | None = None,
+    exists: bool = True,
+) -> Any:
+    """A BaseSqlDestination subclass recording the tracked-state hook calls.
+
+    Every dialect seam (state identifier derivation, existence probe, DDL,
+    and the ``template → executable`` translation that hides ``Composed`` vs
+    ``str``) is stubbed to a plain string so the base control flow can be
+    asserted dialect-free.
+    """
+
+    class _Cur:
+        def execute(self, stmt: Any, params: Any = None) -> None:
+            events.append(f"execute:{stmt}:{params}")
+
+        def executemany(self, stmt: Any, rows: Any) -> None:
+            events.append(f"executemany:{stmt}:{rows}")
+
+        def fetchall(self) -> list[tuple[str, str]]:
+            return list(previous or [])
+
+    class _Conn:
+        def cursor(self) -> _Cur:
+            return _Cur()
+
+        def commit(self) -> None:
+            events.append("commit")
+
+        def close(self) -> None:
+            events.append("close")
+
+    class _Dest(BaseSqlDestination):
+        def _dialect_connect(self, config: Any) -> Any:
+            events.append("connect")
+            return _Conn()
+
+        def _state_table_ident(self, config: Any) -> tuple[Any, Any, Any]:
+            return ("STATE", "sch", "sch._drt_synced_keys")
+
+        def _state_table_exists(self, cur: Any, scope: Any, raw: str) -> bool:
+            events.append(f"exists?:{scope}:{raw}")
+            return exists
+
+        def _create_state_table(self, cur: Any, ident: Any) -> None:
+            events.append(f"create:{ident}")
+
+        def _state_sql(self, template: str, ident: Any) -> Any:
+            return template.format(ident)
+
+        def _build_mirror_delete(
+            self,
+            table: str,
+            upsert_cols: list[str],
+            keys: list[tuple[Any, ...]],
+            scope_cols: list[str] | None = None,
+            scopes: list[tuple[Any, ...]] | None = None,
+            negate: bool = True,
+        ) -> tuple[Any, Any]:
+            return (
+                f"DELETE {table} {upsert_cols} scope={scope_cols} negate={negate}",
+                sorted(keys),
+            )
+
+    return _Dest()
+
+
+def _tracked_opts() -> Any:
+    opts = SimpleNamespace(
+        mode="mirror", mirror=SimpleNamespace(scope=None, strategy="tracked")
+    )
+    opts._sync_name = "s1"
+    return opts
+
+
+def test_tracked_creates_state_table_only_when_absent() -> None:
+    events: list[str] = []
+    d = _tracked_dest(events, exists=False)
+    d._mirror_keys = [(1,)]
+    d._finalize_mirror_tracked(SimpleNamespace(table="t", upsert_key=["id"]), _tracked_opts())
+    assert "exists?:sch:sch._drt_synced_keys" in events
+    assert "create:STATE" in events
+
+    events2: list[str] = []
+    d2 = _tracked_dest(events2, exists=True)
+    d2._mirror_keys = [(1,)]
+    d2._finalize_mirror_tracked(
+        SimpleNamespace(table="t", upsert_key=["id"]), _tracked_opts()
+    )
+    assert not any(e.startswith("create:") for e in events2)
+
+
+def test_tracked_baseline_skips_delete_and_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    events: list[str] = []
+    d = _tracked_dest(events, previous=[])
+    d._mirror_keys = [(1,), (1,)]
+    with caplog.at_level("WARNING"):
+        result = d._finalize_mirror_tracked(
+            SimpleNamespace(table="t", upsert_key=["id"]), _tracked_opts()
+        )
+    assert isinstance(result, SyncResult)
+    assert any("baselin" in r.message.lower() for r in caplog.records)
+    # no target DELETE was built; only the state rewrite touched the DB
+    assert not any("DELETE t" in e for e in events)
+    # dedupe: two identical keys collapse to one state row
+    assert "executemany:INSERT INTO STATE" in " | ".join(events)
+    assert events[-2:] == ["commit", "close"]
+
+
+def test_tracked_deletes_previous_minus_current_via_build_hook() -> None:
+    from drt.destinations._mirror_state import key_hash, key_json
+
+    events: list[str] = []
+    d = _tracked_dest(events, previous=[(key_hash((k,)), key_json((k,))) for k in (1, 2)])
+    d._mirror_keys = [(1,)]
+    d._finalize_mirror_tracked(
+        SimpleNamespace(table="t", upsert_key=["id"]), _tracked_opts()
+    )
+    # the stale key (2,) is deleted through the shared builder with negate=False
+    assert "execute:DELETE t ['id'] scope=None negate=False:[(2,)]" in events
+
+
+def test_tracked_no_stale_keys_issues_no_target_delete() -> None:
+    from drt.destinations._mirror_state import key_hash, key_json
+
+    events: list[str] = []
+    d = _tracked_dest(events, previous=[(key_hash((1,)), key_json((1,)))])
+    d._mirror_keys = [(1,)]
+    d._finalize_mirror_tracked(
+        SimpleNamespace(table="t", upsert_key=["id"]), _tracked_opts()
+    )
+    assert not any("DELETE t" in e for e in events)
+
+
+def test_tracked_falls_back_to_table_name_when_sync_name_absent() -> None:
+    events: list[str] = []
+    d = _tracked_dest(events, previous=[])
+    d._mirror_keys = [(1,)]
+    opts = SimpleNamespace(
+        mode="mirror", mirror=SimpleNamespace(scope=None, strategy="tracked")
+    )
+    opts._sync_name = None
+    d._finalize_mirror_tracked(SimpleNamespace(table="t", upsert_key=["id"]), opts)
+    assert any("executemany:" in e and "'t'" in e for e in events)
+
+
+def test_tracked_closes_connection_when_execute_raises() -> None:
+    events: list[str] = []
+
+    class _Cur:
+        def execute(self, stmt: Any, params: Any = None) -> None:
+            raise RuntimeError("boom")
+
+    class _Conn:
+        def cursor(self) -> _Cur:
+            return _Cur()
+
+        def close(self) -> None:
+            events.append("close")
+
+    class _Dest(BaseSqlDestination):
+        def _dialect_connect(self, config: Any) -> Any:
+            return _Conn()
+
+        def _state_table_ident(self, config: Any) -> tuple[Any, Any, Any]:
+            return ("STATE", None, "_drt_synced_keys")
+
+        def _state_table_exists(self, cur: Any, scope: Any, raw: str) -> bool:
+            return True
+
+        def _state_sql(self, template: str, ident: Any) -> Any:
+            return template.format(ident)
+
+    d = _Dest()
+    d._mirror_keys = [(1,)]
+    with pytest.raises(RuntimeError):
+        d._finalize_mirror_tracked(
+            SimpleNamespace(table="t", upsert_key=["id"]), _tracked_opts()
+        )
+    assert events == ["close"]
