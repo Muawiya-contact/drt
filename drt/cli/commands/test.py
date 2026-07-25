@@ -193,32 +193,6 @@ def execute_tests_for_sync(
                     "value": str(result_val),
                     "severity": test_def.severity,
                 }
-                if store_failures:
-                    stored = _store_or_clear_failure_sample(
-                        sync=sync,
-                        test_def=test_def,
-                        test_id=_test_id(test_def, index),
-                        failing_rows_query=failing_rows_query,
-                        passed=passed,
-                        project_dir=project_dir,
-                        store_failures_limit=store_failures_limit,
-                    )
-                    if stored is not None:
-                        path, count = stored
-                        entry["failures_stored"] = {"path": str(path), "count": count}
-                if show:
-                    print_test_result(
-                        test_name, passed, str(result_val), severity=test_def.severity
-                    )
-                    stored_info = entry.get("failures_stored")
-                    if isinstance(stored_info, dict):
-                        console.print(
-                            f"    [dim]→ {stored_info['count']} failing row(s)"
-                            f" written to {stored_info['path']}[/dim]"
-                        )
-                sync_results["tests"].append(entry)
-                if not passed and test_def.severity != "warn":
-                    had_failures = True
             except Exception as e:
                 if show:
                     print_test_result(test_name, False, str(e), severity=test_def.severity)
@@ -232,6 +206,49 @@ def execute_tests_for_sync(
                 )
                 if test_def.severity != "warn":
                     had_failures = True
+                continue
+
+            # --store-failures (#779): deliberately outside the verdict
+            # try/except above. A storage failure (locked file, disk
+            # permissions, a destination error while sampling) must never
+            # turn a passing test into a failure, or overwrite a genuine
+            # failure's real value with the storage exception's text — the
+            # count-check verdict is authoritative regardless of what
+            # happens here.
+            if store_failures:
+                try:
+                    stored = _store_or_clear_failure_sample(
+                        sync=sync,
+                        test_def=test_def,
+                        test_id=_test_id(test_def, index),
+                        failing_rows_query=failing_rows_query,
+                        passed=passed,
+                        project_dir=project_dir,
+                        store_failures_limit=store_failures_limit,
+                    )
+                except Exception as store_err:
+                    entry["failures_stored"] = {"error": str(store_err)}
+                    if show:
+                        console.print(
+                            f"    [yellow]⚠ could not store failure sample:"
+                            f" {store_err}[/yellow]"
+                        )
+                else:
+                    if stored is not None:
+                        path, count = stored
+                        entry["failures_stored"] = {"path": str(path), "count": count}
+
+            if show:
+                print_test_result(test_name, passed, str(result_val), severity=test_def.severity)
+                stored_info = entry.get("failures_stored")
+                if isinstance(stored_info, dict) and "path" in stored_info:
+                    console.print(
+                        f"    [dim]→ {stored_info['count']} failing row(s)"
+                        f" written to {stored_info['path']}[/dim]"
+                    )
+            sync_results["tests"].append(entry)
+            if not passed and test_def.severity != "warn":
+                had_failures = True
 
     return sync_results, had_failures
 
@@ -291,6 +308,7 @@ def test_syncs(
     store_failures_limit: int = typer.Option(
         10,
         "--store-failures-limit",
+        min=1,
         help="Max rows written per failed test when --store-failures is set.",
     ),
 ) -> None:

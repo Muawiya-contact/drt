@@ -284,8 +284,16 @@ def build_test_query(
     if rows_query is not None:
         alias = "_drt_query_test" if test.query is not None else "_drt_row_test"
         # Subquery-wrapped COUNT(*), same convention as engine/resolver.py's
-        # `_drt_base` — also defangs a stray `;` in `query:` SQL into a syntax
-        # error inside the parens rather than a second statement.
+        # `_drt_base`. This wrap does NOT sandbox `query:` SQL — plain string
+        # concatenation means a value that closes the paren (`) AS x; ...`)
+        # can start a second statement, and several destination drivers
+        # execute multi-statement batches (verified: Snowflake autocommits
+        # each one; Postgres only rolls an uncommitted one back on close(),
+        # which is a side effect of connection defaults, not a guard). `query:`
+        # is arbitrary SQL by design, executed at the SAME trust level as
+        # `model:` — but `model:` runs against the source, while `query:` runs
+        # against the destination, where drt holds write credentials, so the
+        # blast radius of a malicious or careless `query:` is larger.
         query = f"SELECT COUNT(*) FROM ({rows_query}) AS {alias}"
 
         def check_zero(val: int) -> bool:

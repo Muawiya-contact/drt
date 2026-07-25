@@ -345,6 +345,102 @@ def test_store_failures_json_reports_path_and_count(
 
 
 # ---------------------------------------------------------------------------
+# --store-failures storage errors must never affect the test verdict
+# (masukai's PR #830 review, blocking item 2): the count-check result is
+# authoritative; --store-failures is a best-effort debugging convenience
+# layered on top, not a second way to fail or pass a test.
+# ---------------------------------------------------------------------------
+
+
+def test_store_failures_clear_error_does_not_fail_a_passing_test(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A storage error on a PASSING test (e.g. clear_test_failures can't
+    unlink a locked file) must not turn it into a failure — the verdict
+    stays clean, the storage error is reported alongside it."""
+    monkeypatch.chdir(tmp_path)
+    _write_sync(
+        tmp_path,
+        {
+            "name": "s",
+            "model": "SELECT 1",
+            "destination": _DEST,
+            "tests": [{"not_null": {"columns": ["email"]}, "name": "email_nn"}],
+        },
+    )
+    _patch_destination_query(monkeypatch, count=0)  # 0 nulls -> passes
+
+    from drt.state import test_failures as test_failures_module
+
+    def _raise_clear(*args: object, **kwargs: object) -> None:
+        raise PermissionError("file is locked")
+
+    monkeypatch.setattr(test_failures_module, "clear_test_failures", _raise_clear)
+
+    result = runner.invoke(app, ["test", "--store-failures", "--output", "json"])
+    assert result.exit_code == 0
+    payload = json_mod.loads(result.output)
+    entry = payload["results"][0]["tests"][0]
+    assert entry["passed"] is True
+    assert "error" not in entry  # the verdict itself must stay untouched
+    assert entry["failures_stored"] == {"error": "file is locked"}
+
+
+def test_store_failures_fetch_error_preserves_failing_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same principle for a genuine failure: an error while fetching the
+    sample must not discard the real value/verdict in favor of the storage
+    exception's text."""
+    monkeypatch.chdir(tmp_path)
+    _write_sync(
+        tmp_path,
+        {
+            "name": "s",
+            "model": "SELECT 1",
+            "destination": _DEST,
+            "tests": [{"not_null": {"columns": ["email"]}, "name": "email_nn"}],
+        },
+    )
+    from drt.destinations import query as query_module
+
+    monkeypatch.setattr(query_module, "is_queryable", lambda d: True)
+    monkeypatch.setattr(query_module, "get_table_name", lambda d: "test_table")
+    monkeypatch.setattr(query_module, "execute_test_query", lambda d, q: 3)  # fails
+
+    def _raise_fetch(*args: object, **kwargs: object) -> list[dict]:
+        raise ConnectionError("destination unreachable")
+
+    monkeypatch.setattr(query_module, "fetch_failing_rows", _raise_fetch)
+
+    result = runner.invoke(app, ["test", "--store-failures", "--output", "json"])
+    assert result.exit_code == 1  # the real failure, not masked by the storage error
+    payload = json_mod.loads(result.output)
+    entry = payload["results"][0]["tests"][0]
+    assert entry["passed"] is False
+    assert entry["value"] == "3"  # the real count survives
+    assert entry["failures_stored"] == {"error": "destination unreachable"}
+
+
+# ---------------------------------------------------------------------------
+# --store-failures-limit lower bound (masukai's PR #830 review, blocking
+# item 3): a non-positive limit produced a SQL syntax error (`LIMIT -5`)
+# surfaced as a per-test failure rather than a bad-flag usage error.
+# ---------------------------------------------------------------------------
+
+
+def test_store_failures_limit_rejects_non_positive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(
+        app, ["test", "--store-failures", "--store-failures-limit", "0"]
+    )
+    assert result.exit_code != 0
+    assert "store-failures-limit" in result.output
+
+
+# ---------------------------------------------------------------------------
 # severity — exit code / reporting / JSON
 # ---------------------------------------------------------------------------
 
