@@ -712,7 +712,8 @@ class DatabricksDestination:
             conn.close()
         return dropped, failed
 
-    def _connect(self, config: DatabricksDestinationConfig) -> Any:
+    @classmethod
+    def _connect(cls, config: DatabricksDestinationConfig) -> Any:
         """Establish a connection to Databricks via SQL Connector."""
         try:
             from databricks import sql  # type: ignore[import-untyped]
