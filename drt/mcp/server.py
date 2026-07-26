@@ -19,12 +19,35 @@ Tools:
     drt_list_profiles   — list credential profiles (name + type, no secrets)
     drt_test_profile    — connectivity check for a credential profile
     drt_doctor          — environment diagnostics (mirrors `drt doctor` CLI)
+
+Business logic for each tool lives in ``drt/mcp/tools/`` (one module per
+tool, independently testable without a running server); this module wires
+each one up as a thin ``@mcp.tool()`` closure carrying the public
+docstring/signature MCP clients see, plus the shared ``McpContext``
+(``drt/mcp/_context.py``) that replaces the project/sync-config loading
+that used to be duplicated inline in every closure.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+
+from drt.mcp._context import _load_ctx
+from drt.mcp.tools.dlq import dlq as _dlq
+from drt.mcp.tools.doctor import doctor as _doctor
+from drt.mcp.tools.get_history import get_history as _get_history
+from drt.mcp.tools.get_manifest import get_manifest as _get_manifest
+from drt.mcp.tools.get_schema import get_schema as _get_schema
+from drt.mcp.tools.get_status import get_status as _get_status
+from drt.mcp.tools.list_connectors import list_connectors as _list_connectors
+from drt.mcp.tools.list_profiles import list_profiles as _list_profiles
+from drt.mcp.tools.list_syncs import list_syncs as _list_syncs
+from drt.mcp.tools.retry import retry as _retry
+from drt.mcp.tools.run_sync import run_sync as _run_sync
+from drt.mcp.tools.run_test import run_test as _run_test
+from drt.mcp.tools.test_profile import test_profile as _test_profile
+from drt.mcp.tools.validate import validate as _validate
 
 
 def create_server(project_dir: Path | None = None) -> Any:
@@ -35,6 +58,7 @@ def create_server(project_dir: Path | None = None) -> Any:
         raise ImportError("MCP server requires: pip install drt-core[mcp]") from e
 
     _project_dir = project_dir or Path(".")
+    ctx = _load_ctx(_project_dir)
 
     mcp: Any = FastMCP(
         "drt",
@@ -56,19 +80,7 @@ def create_server(project_dir: Path | None = None) -> Any:
         Returns a list of sync summaries including name, description,
         model reference, and destination type.
         """
-        from drt.config.parser import load_syncs
-
-        syncs = load_syncs(_project_dir)
-        return [
-            {
-                "name": s.name,
-                "description": s.description,
-                "model": s.model,
-                "destination_type": s.destination.type,
-                "mode": s.sync.mode,
-            }
-            for s in syncs
-        ]
+        return _list_syncs(ctx)
 
     # -----------------------------------------------------------------------
     # drt_run_sync
@@ -105,58 +117,15 @@ def create_server(project_dir: Path | None = None) -> Any:
             (when ``compute_diff=True``) a ``diff`` field with the
             structured preview.
         """
-        from drt.cli._helpers import resolve_profile_name
-        from drt.cli.main import _get_destination, _get_source
-        from drt.config.credentials import load_profile
-        from drt.config.parser import load_project, load_syncs
-        from drt.engine.sync import run_sync
-        from drt.state.manager import StateManager
-
-        if compute_diff and not dry_run:
-            return {
-                "error": "compute_diff requires dry_run=True (matches the "
-                "`drt run --dry-run --diff` CLI contract)."
-            }
-
-        project = load_project(_project_dir)
-        profile = load_profile(resolve_profile_name(profile_name, project.profile))
-        syncs = load_syncs(_project_dir)
-
-        matched = [s for s in syncs if s.name == sync_name]
-        if not matched:
-            return {"error": f"No sync named '{sync_name}' found."}
-
-        sync = matched[0]
-        source = _get_source(profile)
-        dest = _get_destination(sync)
-        state_mgr = StateManager(_project_dir)
-
-        result = run_sync(
-            sync,
-            source,
-            dest,
-            profile,
-            _project_dir,
-            dry_run,
-            state_mgr,
-            cursor_value_override=(cursor_value if sync.sync.mode == "incremental" else None),
+        return _run_sync(
+            ctx,
+            sync_name,
+            dry_run=dry_run,
             compute_diff=compute_diff,
             diff_limit=diff_limit,
+            cursor_value=cursor_value,
+            profile_name=profile_name,
         )
-
-        response: dict[str, Any] = {
-            "sync_name": sync_name,
-            "dry_run": dry_run,
-            "success": result.success,
-            "failed": result.failed,
-            "errors": result.errors[:10],  # cap at 10 to avoid huge payloads
-        }
-        diff_value = getattr(result, "diff", None)
-        if compute_diff and diff_value is not None:
-            from drt.cli.output import diff_to_dict
-
-            response["diff"] = diff_to_dict(diff_value)
-        return response
 
     # -----------------------------------------------------------------------
     # drt_run_test
@@ -182,65 +151,7 @@ def create_server(project_dir: Path | None = None) -> Any:
                 - `skipped` (optional): true when destination type isn't queryable
                 - `reason` (optional): why the sync was skipped
         """
-        from drt.config.parser import load_syncs
-        from drt.destinations.query import (
-            execute_test_query,
-            get_table_name,
-            is_queryable,
-        )
-        from drt.engine.test_runner import build_test_query, test_display_name
-
-        syncs = load_syncs(_project_dir)
-        if not syncs:
-            return {"status": "no_syncs", "results": []}
-
-        if sync_name is not None:
-            syncs = [s for s in syncs if s.name == sync_name]
-            if not syncs:
-                return {"error": f"No sync named '{sync_name}' found."}
-
-        syncs_with_tests = [s for s in syncs if s.tests]
-        if not syncs_with_tests:
-            return {"status": "no_tests", "results": []}
-
-        had_failures = False
-        results: list[dict[str, Any]] = []
-
-        for sync in syncs_with_tests:
-            sync_result: dict[str, Any] = {"sync": sync.name, "tests": []}
-
-            if not is_queryable(sync.destination):
-                sync_result["skipped"] = True
-                sync_result["reason"] = (
-                    f"tests not supported for {sync.destination.type} destinations"
-                )
-                results.append(sync_result)
-                continue
-
-            table = get_table_name(sync.destination)
-            for test_def in sync.tests:
-                test_name = test_display_name(test_def)
-                try:
-                    query, check = build_test_query(test_def, table)
-                    result_val = execute_test_query(sync.destination, query)
-                    passed = check(result_val)
-                    sync_result["tests"].append(
-                        {"name": test_name, "passed": passed, "value": str(result_val)}
-                    )
-                    if not passed:
-                        had_failures = True
-                except Exception as e:
-                    sync_result["tests"].append(
-                        {"name": test_name, "passed": False, "error": str(e)}
-                    )
-                    had_failures = True
-
-            results.append(sync_result)
-
-        return {
-            "status": "failed" if had_failures else "passed",
-            "results": results,
-        }
+        return _run_test(ctx, sync_name)
 
     # -----------------------------------------------------------------------
     # drt_get_status
@@ -257,34 +168,7 @@ def create_server(project_dir: Path | None = None) -> Any:
             Dict of sync_name → last run status (last_run_at, records_synced,
             status, last_cursor_value).
         """
-        from drt.state.manager import StateManager
-
-        states = StateManager(_project_dir).get_all()
-
-        if sync_name:
-            if sync_name not in states:
-                return {"error": f"No state found for sync '{sync_name}'."}
-            s = states[sync_name]
-            return {
-                sync_name: {
-                    "last_run_at": s.last_run_at,
-                    "records_synced": s.records_synced,
-                    "status": s.status,
-                    "last_cursor_value": s.last_cursor_value,
-                    "error": s.error,
-                }
-            }
-
-        return {
-            name: {
-                "last_run_at": s.last_run_at,
-                "records_synced": s.records_synced,
-                "status": s.status,
-                "last_cursor_value": s.last_cursor_value,
-                "error": s.error,
-            }
-            for name, s in states.items()
-        }
+        return _get_status(ctx, sync_name)
 
     # -----------------------------------------------------------------------
     # drt_get_history
@@ -311,12 +195,7 @@ def create_server(project_dir: Path | None = None) -> Any:
             started_at, completed_at, duration_seconds, status, records_synced,
             records_failed, errors (truncated), and cursor_value_used.
         """
-        from dataclasses import asdict
-
-        from drt.state.history import HistoryManager
-
-        entries = HistoryManager(_project_dir).read(sync_name=sync_name, limit=limit)
-        return {"entries": [asdict(e) for e in entries]}
+        return _get_history(ctx, sync_name, limit)
 
     # -----------------------------------------------------------------------
     # drt_validate
@@ -330,13 +209,7 @@ def create_server(project_dir: Path | None = None) -> Any:
             Dict with 'valid' list of sync names and 'errors' dict of
             sync_name → list of error messages for any invalid configs.
         """
-        from drt.config.parser import load_syncs_safe
-
-        result = load_syncs_safe(_project_dir)
-        return {
-            "valid": [s.name for s in result.syncs],
-            "errors": result.errors,
-        }
+        return _validate(ctx)
 
     # -----------------------------------------------------------------------
     # drt_get_schema
@@ -353,11 +226,7 @@ def create_server(project_dir: Path | None = None) -> Any:
         Returns:
             JSON Schema as a dict.
         """
-        from drt.config.schema import generate_project_schema, generate_sync_schema
-
-        if schema_type == "project":
-            return generate_project_schema()
-        return generate_sync_schema()
+        return _get_schema(schema_type)
 
     # -----------------------------------------------------------------------
     # drt_list_connectors
@@ -371,12 +240,7 @@ def create_server(project_dir: Path | None = None) -> Any:
             Dict with 'sources' and 'destinations' lists, each containing
             connector name, type key, and install extras (if any).
         """
-        # Derived from the drt.config.connectors SSoT (kept in lockstep with
-        # drt/connectors/registry.py by test_cli_list_connectors), so this
-        # inventory can never fall out of sync with the registry.
-        from drt.config.connectors import connector_inventory
-
-        return connector_inventory()
+        return _list_connectors()
 
     # -----------------------------------------------------------------------
     # drt_dlq
@@ -398,22 +262,7 @@ def create_server(project_dir: Path | None = None) -> Any:
             (each with the failed payload, error_message, http_status, timestamp,
             attempts) and a ``truncated`` flag.
         """
-        from dataclasses import asdict
-
-        from drt.state.dlq import DlqStore
-
-        store = DlqStore(_project_dir)
-        if sync_name is None:
-            return {"depths": store.all_depths()}
-
-        depth = store.depth(sync_name)
-        records = [asdict(e) for e in store.read(sync_name)[:limit]]
-        return {
-            "sync_name": sync_name,
-            "depth": depth,
-            "records": records,
-            "truncated": depth > len(records),
-        }
+        return _dlq(ctx, sync_name, limit)
 
     # -----------------------------------------------------------------------
     # drt_retry
@@ -443,20 +292,7 @@ def create_server(project_dir: Path | None = None) -> Any:
             and, for a real run, ``succeeded`` / ``still_failing`` /
             ``remaining_depth`` counts.
         """
-        from drt.cli.commands.retry import replay_dead_letters
-        from drt.config.parser import load_syncs
-
-        if limit is not None and limit < 0:
-            return {"error": "limit must be >= 0."}
-
-        syncs = load_syncs(_project_dir)
-        sync = next((s for s in syncs if s.name == sync_name), None)
-        if sync is None:
-            return {"error": f"No sync named '{sync_name}' found."}
-
-        return replay_dead_letters(
-            sync, limit=limit, dry_run=dry_run, clear=clear, project_dir=_project_dir
-        )
+        return _retry(ctx, sync_name, limit=limit, dry_run=dry_run, clear=clear)
 
     # -----------------------------------------------------------------------
     # drt_get_manifest
@@ -488,14 +324,12 @@ def create_server(project_dir: Path | None = None) -> Any:
         Returns:
             The manifest as a JSON-serializable dict (schema-versioned).
         """
-        from drt.docs.builder import build_manifest
-
-        return build_manifest(
-            _project_dir,
+        return _get_manifest(
+            ctx,
             include_state=include_state,
             full_labels=full_labels,
             history_depth=history_depth,
-        ).to_dict()
+        )
 
     # -----------------------------------------------------------------------
     # drt_list_profiles
@@ -511,15 +345,7 @@ def create_server(project_dir: Path | None = None) -> Any:
         Returns:
             ``{"profiles": [{"name": ..., "type": ...}, ...]}``.
         """
-        from drt.config.credentials import load_raw_profiles
-
-        profiles = load_raw_profiles()
-        return {
-            "profiles": [
-                {"name": name, "type": (raw.get("type") if isinstance(raw, dict) else None)}
-                for name, raw in profiles.items()
-            ]
-        }
+        return _list_profiles()
 
     # -----------------------------------------------------------------------
     # drt_test_profile
@@ -539,21 +365,7 @@ def create_server(project_dir: Path | None = None) -> Any:
             ``{"name": ..., "type": ..., "ok": bool}`` and, on failure, an
             ``error`` message.
         """
-        from drt.config.credentials import load_profile
-        from drt.connectors.registry import get_source
-
-        try:
-            profile = load_profile(name)
-        except (FileNotFoundError, KeyError, ValueError) as e:
-            return {"name": name, "ok": False, "error": str(e)}
-
-        source = get_source(profile)
-        try:
-            ok = source.test_connection(profile)
-        except Exception as e:
-            return {"name": name, "type": profile.type, "ok": False, "error": str(e)}
-
-        return {"name": name, "type": profile.type, "ok": bool(ok)}
+        return _test_profile(name)
 
     # -----------------------------------------------------------------------
     # drt_doctor
@@ -573,62 +385,7 @@ def create_server(project_dir: Path | None = None) -> Any:
             "message"}, ...]}`` where ``passed`` is False if any required
             check failed (project file / profile / Python version).
         """
-        from drt import __version__ as drt_version
-        from drt.cli.doctor import (
-            _check_env_vars,
-            _check_extras,
-            _check_profile,
-            _check_project_file,
-            _check_python,
-            _check_syncs,
-        )
-
-        checks: list[dict[str, Any]] = []
-        required_ok = True
-
-        py_ok, py_msg = _check_python()
-        checks.append(
-            {"category": "runtime", "name": "Python version", "ok": py_ok, "message": py_msg}
-        )
-        required_ok = required_ok and py_ok
-
-        checks.append(
-            {
-                "category": "runtime",
-                "name": "drt version",
-                "ok": True,
-                "message": drt_version,
-            }
-        )
-
-        proj_ok, proj_msg, project_data = _check_project_file()
-        checks.append(
-            {"category": "project", "name": "Project file", "ok": proj_ok, "message": proj_msg}
-        )
-        required_ok = required_ok and proj_ok
-
-        if project_data:
-            prof_ok, prof_msg = _check_profile(project_data)
-            checks.append(
-                {"category": "project", "name": "Profile", "ok": prof_ok, "message": prof_msg}
-            )
-            required_ok = required_ok and prof_ok
-
-            _, syncs_ok, syncs_msg = _check_syncs(project_data)
-            checks.append(
-                {"category": "project", "name": "Syncs", "ok": syncs_ok, "message": syncs_msg}
-            )
-
-        for label, ok, msg in _check_extras():
-            # Extras are optional — they affect ``ok`` of the row but not
-            # overall ``passed``. A user can run a duckdb-only project with
-            # no other extras installed and that's fine.
-            checks.append({"category": "extras", "name": label, "ok": ok, "message": msg})
-
-        for var, ok, msg in _check_env_vars(project_data):
-            checks.append({"category": "env", "name": var, "ok": ok, "message": msg})
-
-        return {"passed": required_ok, "checks": checks}
+        return _doctor()
 
     return mcp
 
