@@ -23,6 +23,11 @@ if TYPE_CHECKING:
     from drt.sources.base import Source
 
 
+def exit_code_for_signal(signum: int) -> int:
+    """POSIX convention: 128 + signal number (SIGINT=2 → 130, SIGTERM=15 → 143)."""
+    return 128 + signum
+
+
 def resolve_profile_name(cli_flag: str | None, project_profile: str) -> str:
     """Resolve which profile to use.
 

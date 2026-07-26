@@ -140,13 +140,13 @@ def _get_destination(sync: SyncConfig) -> Destination:
 # implementations now live in drt/cli/commands/run.py; re-export so the
 # legacy import path keeps working. New callers should import from
 # drt.cli.commands.run directly.
+from drt.cli._helpers import exit_code_for_signal as _exit_code_for_signal  # noqa: E402, F401
 from drt.cli._logging import (  # noqa: E402, F401
     _configure_json_logging,
     _JsonFormatter,
 )
 from drt.cli.commands.run import (  # noqa: E402, F401
     LogFormat,
-    _exit_code_for_signal,
     _print_watermark_summary,
     _run_one,
     _RunContext,
