@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -22,6 +23,25 @@ from drt.destinations.query import (
     fetch_tracked_state,
     get_table_name,
     is_queryable,
+)
+
+
+def _has_psycopg2() -> bool:
+    try:
+        return importlib.util.find_spec("psycopg2") is not None
+    except (ImportError, ValueError):
+        # find_spec raises rather than returning None for some broken/partial
+        # installs; either way the extra isn't usable here.
+        return False
+
+
+# The Postgres cases below reach into ``psycopg2.sql`` to render a ``Composed``
+# without a live connection, so they need the [postgres] extra. The MySQL /
+# Snowflake / ClickHouse cases in this module don't — mark only the Postgres
+# ones rather than skipping the whole file, so a minimal install (the release
+# workflow's verify job) still exercises the rest.
+needs_psycopg2 = pytest.mark.skipif(
+    not _has_psycopg2(), reason="requires drt-core[postgres]"
 )
 
 
@@ -194,6 +214,7 @@ def _render_pg(composed: Any) -> str:
     return "".join(parts)
 
 
+@needs_psycopg2
 def test_fetch_rows_by_keys_postgres_parameterized_and_batched() -> None:
     cursor = MagicMock()
     # 3 keys, batch_size 2 -> two batches (2 rows then 1 row).
@@ -235,6 +256,7 @@ def test_fetch_rows_by_keys_postgres_parameterized_and_batched() -> None:
     conn.close.assert_called_once()
 
 
+@needs_psycopg2
 def test_fetch_rows_by_keys_postgres_composite_key_placeholders() -> None:
     cursor = MagicMock()
     cursor.fetchall.side_effect = [[(1, "eu", "x")]]
@@ -413,6 +435,7 @@ def _assert_read_only(cursor: MagicMock) -> None:
             assert kw not in upper, f"write keyword {kw} in {text}"
 
 
+@needs_psycopg2
 def test_fetch_tracked_state_postgres_selects_only() -> None:
     cursor = MagicMock()
     # to_regclass probe -> exists; then the state rows.
@@ -438,6 +461,7 @@ def test_fetch_tracked_state_postgres_selects_only() -> None:
     conn.close.assert_called_once()
 
 
+@needs_psycopg2
 def test_fetch_tracked_state_postgres_unqualified_table() -> None:
     cursor = MagicMock()
     cursor.fetchone.return_value = ("_drt_synced_keys",)
@@ -455,6 +479,7 @@ def test_fetch_tracked_state_postgres_unqualified_table() -> None:
     assert '"_drt_synced_keys"' in _render_pg(cursor.execute.call_args_list[1][0][0])
 
 
+@needs_psycopg2
 def test_fetch_tracked_state_postgres_missing_table_returns_empty() -> None:
     cursor = MagicMock()
     cursor.fetchone.return_value = (None,)  # to_regclass -> NULL
@@ -555,6 +580,7 @@ def test_fetch_tracked_state_unsupported_dialect_returns_empty() -> None:
 # ---------------------------------------------------------------------------
 
 
+@needs_psycopg2
 def test_fetch_all_keys_postgres_selects_key_columns_only() -> None:
     cursor = MagicMock()
     cursor.fetchall.return_value = [(1,), (2,), (3,)]
@@ -575,6 +601,7 @@ def test_fetch_all_keys_postgres_selects_key_columns_only() -> None:
     conn.close.assert_called_once()
 
 
+@needs_psycopg2
 def test_fetch_all_keys_postgres_composite_key() -> None:
     cursor = MagicMock()
     cursor.fetchall.return_value = [("c1", "u1"), ("c1", "u2")]
@@ -591,6 +618,7 @@ def test_fetch_all_keys_postgres_composite_key() -> None:
     _assert_read_only(cursor)
 
 
+@needs_psycopg2
 def test_fetch_all_keys_postgres_scope_filters_server_side() -> None:
     """mirror.scope narrows the read in SQL, not in Python.
 
@@ -621,6 +649,7 @@ def test_fetch_all_keys_postgres_scope_filters_server_side() -> None:
     _assert_read_only(cursor)
 
 
+@needs_psycopg2
 def test_fetch_all_keys_postgres_composite_scope() -> None:
     cursor = MagicMock()
     cursor.fetchall.return_value = []
@@ -643,6 +672,7 @@ def test_fetch_all_keys_postgres_composite_scope() -> None:
     assert params == ((("eu", "gold"), ("us", "silver")),)
 
 
+@needs_psycopg2
 def test_fetch_all_keys_postgres_empty_scopes_reads_whole_table() -> None:
     """``scope_cols`` set but nothing observed → no scope clause.
 
