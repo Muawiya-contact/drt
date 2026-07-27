@@ -365,8 +365,8 @@ class ClickHouseDestination:
         finally:
             client.close()
 
-    @staticmethod
-    def _connect(config: ClickHouseDestinationConfig) -> Any:
+    @classmethod
+    def _connect(cls, config: ClickHouseDestinationConfig) -> Any:
         try:
             import clickhouse_connect  # type: ignore[import-untyped]
         except ImportError as e:

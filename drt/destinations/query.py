@@ -96,9 +96,7 @@ def _query_clickhouse(config: ClickHouseDestinationConfig, query: str) -> int:
 def _query_snowflake(config: SnowflakeDestinationConfig, query: str) -> int:
     from drt.destinations.snowflake import SnowflakeDestination
 
-    # _connect is an instance method on the Snowflake destination (unlike the
-    # staticmethod on Postgres); the no-arg constructor has no side effects.
-    conn = SnowflakeDestination()._connect(config)
+    conn = SnowflakeDestination._connect(config)
     try:
         with conn.cursor() as cur:
             cur.execute(query)
@@ -191,7 +189,7 @@ def _fetch_rows_snowflake(
 ) -> list[dict[str, Any]]:
     from drt.destinations.snowflake import SnowflakeDestination
 
-    conn = SnowflakeDestination()._connect(config)
+    conn = SnowflakeDestination._connect(config)
     try:
         with conn.cursor() as cur:
             cur.execute(query)
@@ -366,7 +364,7 @@ def _fetch_rows_by_keys_snowflake(
     else:
         key_expr = "(" + ", ".join(key_cols) + ")"
 
-    conn = SnowflakeDestination()._connect(config)
+    conn = SnowflakeDestination._connect(config)
     try:
         result: list[dict[str, Any]] = []
         with conn.cursor() as cur:

@@ -552,7 +552,8 @@ class SnowflakeDestination:
             conn.close()
         return dropped, failed
 
-    def _connect(self, config: SnowflakeDestinationConfig) -> Any:
+    @classmethod
+    def _connect(cls, config: SnowflakeDestinationConfig) -> Any:
         """Establish a connection to Snowflake."""
         try:
             import snowflake.connector

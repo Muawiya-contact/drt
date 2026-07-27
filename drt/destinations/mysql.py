@@ -114,7 +114,7 @@ class MySQLDestination(BaseSqlDestination):
 
     # --- dialect hooks (#719) ---------------------------------------------
     def _dialect_connect(self, config: Any) -> Any:
-        return self._connect(config)  # _connect is @staticmethod(config)
+        return self._connect(config)  # _connect is @classmethod(config) — #723
 
     def _qualify_ident(self, name: str) -> Any:
         return self._quote_ident(name)  # _quote_ident is @staticmethod
@@ -400,8 +400,8 @@ class MySQLDestination(BaseSqlDestination):
         # All columns are part of the key — just ignore duplicates
         return f"INSERT IGNORE INTO {table_q} ({cols_str}) VALUES ({placeholders})"
 
-    @staticmethod
-    def _connect(config: MySQLDestinationConfig) -> Any:
+    @classmethod
+    def _connect(cls, config: MySQLDestinationConfig) -> Any:
         try:
             import pymysql
         except ImportError as e:

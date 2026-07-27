@@ -198,8 +198,7 @@ def _categorize_mysql(data_type: str | None) -> str:
 def _connect_snowflake(config: SnowflakeDestinationConfig) -> Any:
     from drt.destinations.snowflake import SnowflakeDestination
 
-    # _connect is an instance method on the Snowflake destination.
-    return SnowflakeDestination()._connect(config)
+    return SnowflakeDestination._connect(config)
 
 
 def _query_snowflake(config: SnowflakeDestinationConfig) -> tuple[str, list[Any]]:
@@ -232,8 +231,7 @@ def _categorize_snowflake(data_type: str | None) -> str:
 def _connect_databricks(config: DatabricksDestinationConfig) -> Any:
     from drt.destinations.databricks import DatabricksDestination
 
-    # ``_connect`` is an instance method on the Databricks destination.
-    return DatabricksDestination()._connect(config)
+    return DatabricksDestination._connect(config)
 
 
 def _query_databricks(config: DatabricksDestinationConfig) -> tuple[str, list[Any]]:
@@ -306,7 +304,7 @@ def describe_databricks_ddls(
     )
     params: list[Any] = [config.schema_, config.table]
     try:
-        conn = DatabricksDestination()._connect(config)
+        conn = DatabricksDestination._connect(config)
         try:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
