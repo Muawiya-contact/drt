@@ -55,15 +55,29 @@ def run_test(ctx: McpContext, sync_name: str | None = None) -> dict[str, Any]:
                 result_val = execute_test_query(sync.destination, query)
                 passed = check(result_val)
                 sync_result["tests"].append(
-                    {"name": test_name, "passed": passed, "value": str(result_val)}
+                    {
+                        "name": test_name,
+                        "passed": passed,
+                        "value": str(result_val),
+                        "severity": test_def.severity,
+                    }
                 )
-                if not passed:
+                # severity: warn (#779) is reported but must not flip
+                # `status` to "failed" — same rule drt test / drt build
+                # apply, so this tool doesn't drift from the CLI (#400).
+                if not passed and test_def.severity != "warn":
                     had_failures = True
             except Exception as e:
                 sync_result["tests"].append(
-                    {"name": test_name, "passed": False, "error": str(e)}
+                    {
+                        "name": test_name,
+                        "passed": False,
+                        "error": str(e),
+                        "severity": test_def.severity,
+                    }
                 )
-                had_failures = True
+                if test_def.severity != "warn":
+                    had_failures = True
 
         results.append(sync_result)
 
