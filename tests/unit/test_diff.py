@@ -10,8 +10,11 @@ Covers compute_diff() across:
 
 from __future__ import annotations
 
+import importlib.util
 from typing import Any
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from drt.config.models import (
     PostgresDestinationConfig,
@@ -21,6 +24,23 @@ from drt.config.models import (
 )
 from drt.destinations._mirror_state import key_hash, key_json
 from drt.engine.diff import DiffResult, compute_diff
+
+
+def _has_psycopg2() -> bool:
+    try:
+        return importlib.util.find_spec("psycopg2") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+# The two read-only proofs below deliberately run the *real* query helper
+# (rather than a mock) to show no write statement is issued — which means they
+# need the [postgres] extra. Every other case here mocks the fetch, so only
+# these two are marked.
+needs_psycopg2 = pytest.mark.skipif(
+    not _has_psycopg2(), reason="requires drt-core[postgres]"
+)
+
 
 
 def _pg_config(
@@ -370,6 +390,7 @@ class TestComputeDiffMirrorTracked:
 
     @patch("drt.engine.diff.fetch_tracked_state")
     @patch("drt.engine.diff.fetch_rows_by_keys")
+    @needs_psycopg2
     def test_tracked_preview_is_read_only(
         self, mock_fetch_keys: Any, mock_state: Any
     ) -> None:
@@ -765,6 +786,7 @@ class TestComputeDiffMirrorDestination:
 
     @patch("drt.engine.diff.fetch_all_keys")
     @patch("drt.engine.diff.fetch_rows_by_keys")
+    @needs_psycopg2
     def test_destination_preview_is_read_only(
         self, mock_fetch_keys: Any, mock_all_keys: Any
     ) -> None:
