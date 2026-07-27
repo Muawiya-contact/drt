@@ -5,16 +5,20 @@ Extracted from ``drt/cli/main.py`` in Phase 2b PR (a) of the #546 split
 
 - ``LogFormat`` Enum (the ``--log-format`` option)
 - ``_RunContext`` dataclass (shared state for one sync invocation)
-- ``_exit_code_for_signal`` (POSIX 128 + signum convention)
-- ``_run_one`` (per-sync execution; observer composition; telemetry)
+- ``_run_one`` (per-sync execution; observer composition via ``_build_observer``;
+  telemetry)
 - ``_print_watermark_summary`` (post-run notes about default / override
   watermark usage)
 - ``run`` (the @app.command itself; signal handling; parallel/sequential
   dispatch; JSON-mode output)
 
-The JSON Lines logging itself (``_JsonFormatter`` / ``_configure_json_logging``)
-was factored out to ``drt.cli._logging`` (#723) and is re-imported here; the
-rest stays because ``run`` is their only caller.
+Two pieces of generic infrastructure that started here have since moved to
+``drt.cli._helpers`` (#723) and are re-imported: the JSON Lines logging
+(``_JsonFormatter`` / ``_configure_json_logging``, factored out earlier)
+and ``_exit_code_for_signal`` (the POSIX 128 + signum convention, imported
+here under its original name for the ``drt.cli.main`` back-compat
+re-export). The rest of this module's original contents stay because
+``run`` is their only caller.
 
 Back-compat: ``drt.cli.main`` re-exports each of the underscore-prefixed
 names + ``LogFormat`` so that ``from drt.cli.main import _RunContext``
@@ -47,6 +51,9 @@ if TYPE_CHECKING:
 
 
 from drt.cli._app import app
+from drt.cli._helpers import (
+    exit_code_for_signal as _exit_code_for_signal,
+)
 from drt.cli._helpers import (
     get_destination,
     get_source,
@@ -111,9 +118,32 @@ class _RunContext:
     vars: dict[str, Any] | None = None
 
 
-def _exit_code_for_signal(signum: int) -> int:
-    """POSIX convention: 128 + signal number (SIGINT=2 → 130, SIGTERM=15 → 143)."""
-    return 128 + signum
+def _build_observer(sync: SyncConfig, ctx: _RunContext, wm_storage: Any) -> Any:
+    """Compose the engine's default observer surface for one sync (#723).
+
+    Logging events to the ``drt`` logger (legacy parity) + state/watermark
+    persistence on sync_completed — the engine itself no longer reaches for
+    state directly (#548); the CLI wires this up here. Dead Letter Queue
+    (#278) is opt-in per sync, adding a ``DlqObserver`` that persists failed
+    records to ``.drt/dlq/<sync>.jsonl`` for ``drt retry`` — skipped on dry
+    runs, since nothing is actually sent, so nothing can fail.
+    """
+    from drt.engine.observer import (
+        CompositeObserver,
+        DlqObserver,
+        LoggingObserver,
+        StatePersistingObserver,
+    )
+
+    observers: list[Any] = [
+        LoggingObserver(),
+        StatePersistingObserver(ctx.state_mgr, wm_storage),
+    ]
+    if not ctx.dry_run and sync.sync.dlq is not None and sync.sync.dlq.enabled:
+        from drt.state.dlq import DlqStore
+
+        observers.append(DlqObserver(DlqStore(Path(".")), max_records=sync.sync.dlq.max_records))
+    return CompositeObserver(observers)
 
 
 def _run_one(
@@ -123,32 +153,11 @@ def _run_one(
 ) -> tuple[str, dict[str, object], bool]:
     """Execute a single sync and return (name, result_dict, had_error)."""
     from drt import telemetry
-    from drt.engine.observer import (
-        CompositeObserver,
-        DlqObserver,
-        LoggingObserver,
-        StatePersistingObserver,
-    )
     from drt.engine.sync import run_sync
 
     dest = get_destination(sync)
     wm_storage = get_watermark_storage(sync, Path("."))
-    # Compose the engine's default observer surface: logging events to the
-    # ``drt`` logger (legacy parity) + state/watermark persistence on
-    # sync_completed. The engine itself no longer reaches for state directly
-    # (#548); CLI is responsible for wiring this up.
-    observers: list[Any] = [
-        LoggingObserver(),
-        StatePersistingObserver(ctx.state_mgr, wm_storage),
-    ]
-    # Dead Letter Queue (#278): opt-in per sync. Adds a DlqObserver that
-    # persists failed records to .drt/dlq/<sync>.jsonl for `drt retry`.
-    # Skipped on dry runs — nothing is actually sent, so nothing can fail.
-    if not ctx.dry_run and sync.sync.dlq is not None and sync.sync.dlq.enabled:
-        from drt.state.dlq import DlqStore
-
-        observers.append(DlqObserver(DlqStore(Path(".")), max_records=sync.sync.dlq.max_records))
-    observer = CompositeObserver(observers)
+    observer = _build_observer(sync, ctx, wm_storage)
     if not ctx.json_mode and not ctx.dry_run and not ctx.quiet:
         print_sync_start(sync.name, ctx.dry_run)
     t0 = time.monotonic()
