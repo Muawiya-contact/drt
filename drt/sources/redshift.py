@@ -23,6 +23,8 @@ from collections.abc import Iterator
 from typing import Any
 
 from drt.config.credentials import ProfileConfig, RedshiftProfile
+from drt.config.models import RetryConfig
+from drt.destinations.retry import with_retry
 
 
 class RedshiftSource:
@@ -35,21 +37,76 @@ class RedshiftSource:
       - Connection string uses same parameters
     """
 
-    def extract(self, query: str, config: ProfileConfig) -> Iterator[dict[str, Any]]:
-        """Execute query and yield records as dicts."""
-        assert isinstance(config, RedshiftProfile)
-        conn = self._connect(config)
+    def _is_transient(self, exc: Exception) -> bool:
+        """Is ``exc`` worth retrying? (#766)
+
+        Same psycopg2 classification as the Postgres source — Redshift speaks
+        the Postgres wire protocol through the same driver. Transient:
+        ``OperationalError`` (connection refused, cluster failover, a paused
+        serverless workgroup resuming, the WLM dropping an idle session) and
+        ``InterfaceError``. Permanent: ``ProgrammingError`` / ``DataError`` /
+        ``IntegrityError``.
+
+        Matched against ``OperationalError`` / ``InterfaceError`` rather than
+        the shared ``DatabaseError`` base — under PEP 249 the permanent
+        classes are siblings of ``OperationalError``, so a base-class check
+        would retry bad SQL.
+
+        Authentication failures are excluded even though psycopg2 files them
+        *under* ``OperationalError`` (``InvalidPassword``,
+        ``InvalidAuthorizationSpecification`` — SQLSTATE class ``28``).
+        Retrying a wrong credential three times in quick succession can trip
+        an account lockout, turning a config typo into an outage.
+        """
         try:
-            cur = conn.cursor()
-            # Set search_path to the configured schema
-            if config.schema:
-                cur.execute("SET search_path TO %s", (config.schema,))
-            cur.execute(query)
-            columns = [desc[0] for desc in cur.description]
-            for row in cur.fetchall():
-                yield dict(zip(columns, row))
-        finally:
-            conn.close()
+            import psycopg2
+        except ImportError:  # pragma: no cover - driver absent, nothing to classify
+            return False
+        if not isinstance(exc, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+            return False
+        # Exclude authentication failures. psycopg2 files these *under*
+        # OperationalError, so the isinstance above lets them through.
+        # Matched two ways because either can be absent: by class (works for
+        # any exception the driver constructs) and by SQLSTATE class 28,
+        # invalid_authorization_specification (set only on server-raised
+        # errors, but authoritative when present).
+        auth_errors = (
+            psycopg2.errors.InvalidAuthorizationSpecification,
+            psycopg2.errors.InvalidPassword,
+        )
+        if isinstance(exc, auth_errors):
+            return False
+        pgcode = getattr(exc, "pgcode", None)
+        return not (pgcode and str(pgcode).startswith("28"))
+
+    def extract(self, query: str, config: ProfileConfig) -> Iterator[dict[str, Any]]:
+        """Execute query and yield records as dicts, retrying transient failures.
+
+        **Retry scope (#766): connection and query execution only.** A failure
+        after the first row has been yielded propagates — those rows are
+        already loaded downstream and cannot be un-sent. See the Postgres
+        source for the full rationale.
+        """
+        assert isinstance(config, RedshiftProfile)
+
+        def _connect_and_fetch() -> tuple[list[str], list[Any]]:
+            conn = self._connect(config)
+            try:
+                cur = conn.cursor()
+                # Set search_path to the configured schema
+                if config.schema:
+                    cur.execute("SET search_path TO %s", (config.schema,))
+                cur.execute(query)
+                columns = [desc[0] for desc in cur.description]
+                return columns, cur.fetchall()
+            finally:
+                conn.close()
+
+        columns, rows = with_retry(_connect_and_fetch, RetryConfig(), retry_on=self._is_transient)
+
+        # Iteration stays outside the retry — a yielded row cannot be un-sent.
+        for row in rows:
+            yield dict(zip(columns, row))
 
     def test_connection(self, config: ProfileConfig) -> bool:
         """Test if the Redshift cluster is reachable."""
