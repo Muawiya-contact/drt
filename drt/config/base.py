@@ -12,6 +12,23 @@ from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+LITERAL_CREDENTIAL_KEY = "literal"
+"""Rate-limit identity for a config that inlines its credential (#769).
+
+Configs that name an env var (``token_env``) key on that name — it pins the
+account without the secret ever reaching a dict key. When a config inlines the
+literal instead, we deliberately do **not** derive a key from it, not even a
+digest: a rate-limit key is not worth putting credential-derived material into
+process memory for, and any fast digest of a credential-shaped value is
+correctly flagged as weak password hashing (there is no "but it's only an
+identifier" exception a scanner can see).
+
+The cost is that two destinations of the same type both using inline literals
+collapse into one bucket. That errs *toward* throttling — a shared bucket is
+stricter than two, so the failure mode is a slower sync, never a 429. Naming
+the env var is the documented way to get per-account buckets.
+"""
+
 
 class DescribableConfig(BaseModel):
     """Mixin base for destination configs whose ``describe()`` is the canonical
@@ -42,6 +59,32 @@ class DescribableConfig(BaseModel):
 
     def _describe_detail(self) -> str:  # pragma: no cover - always overridden
         raise NotImplementedError
+
+    def rate_limit_key(self) -> str:
+        """Identity of the endpoint whose vendor quota this config consumes (#769).
+
+        The rate-limiter registry buckets by this key, so two configs share one
+        limiter exactly when they share one quota. Deliberately *not*
+        ``describe()``: that label is tuned for humans reading a docs site and
+        gets this wrong in both directions — ``SlackDestinationConfig`` describes
+        every webhook as the literal ``"webhook"`` (unrelated workspaces would
+        throttle each other), while ``HubSpotDestinationConfig`` includes
+        ``object_type`` (one portal's contacts and deals would get a bucket each
+        despite sharing a quota). ``describe_safe()`` is lossy on purpose (#696),
+        which is the opposite of what a key needs.
+
+        The default is the connector type: correct whenever a quota is
+        effectively global to the connector, and safe as a fallback because it
+        over-shares (one bucket) rather than under-shares — the failure mode is
+        pacing, not a 429. Connectors whose quota is per account, per host or per
+        workspace override this and prefix the type so two connectors can never
+        collide. Prefer env-var *names* over resolved secrets; a config that
+        inlines its credential keys on :data:`LITERAL_CREDENTIAL_KEY` rather
+        than deriving anything from the secret.
+
+        Never log or serialize the return value.
+        """
+        return str(self.type)  # type: ignore[attr-defined]
 
 
 class BearerAuth(BaseModel):
@@ -213,3 +256,23 @@ class RetryConfig(BaseModel):
     backoff_multiplier: float = 2.0
     max_backoff: float = 60.0
     retryable_status_codes: tuple[int, ...] = (429, 500, 502, 503, 504)
+
+
+class RateLimitConfig(BaseModel):
+    """Request pacing for a destination or a whole sync (#769).
+
+    Lives here beside :class:`RetryConfig` rather than in ``sync_options``
+    because the destination configs now carry a ``rate_limit`` override and
+    ``sync_options`` imports *them* — defining it there would close an import
+    cycle. ``sync_options`` re-exports it, so ``drt.config.models`` and every
+    existing import path are unchanged.
+    """
+
+    # float rather than int (#769): RateLimiter.requests_per_second was already
+    # annotated float and sub-1/s rates (2.5 → one request per 0.4 s) were
+    # already exercised, so this widening is a compatibility fix, not a feature.
+    requests_per_second: float = 10
+    # Opt-in burst capacity (#769). None keeps the historical minimum-interval
+    # behaviour exactly; a value lets an idle period accumulate up to N
+    # requests' worth of credit that can be spent back-to-back.
+    burst: int | None = Field(default=None, ge=1)
