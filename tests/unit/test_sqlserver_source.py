@@ -107,6 +107,22 @@ def _install_fake_pymssql(monkeypatch: pytest.MonkeyPatch) -> object:
     class IntegrityError(DatabaseError):
         pass
 
+    # Added in #862 once the pin enumerated the real module rather than a
+    # hand-kept list. ColumnsWithoutNamesError sits under InterfaceError —
+    # a class the classifier treats as *retryable* — so its shape is not
+    # incidental.
+    class InternalError(DatabaseError):
+        pass
+
+    class NotSupportedError(DatabaseError):
+        pass
+
+    class ColumnsWithoutNamesError(InterfaceError):
+        pass
+
+    class Warning(Exception):  # noqa: A001 - mirrors the driver's name
+        pass
+
     mod = types.ModuleType("pymssql")
     for cls in (
         Error,
@@ -116,6 +132,10 @@ def _install_fake_pymssql(monkeypatch: pytest.MonkeyPatch) -> object:
         ProgrammingError,
         DataError,
         IntegrityError,
+        InternalError,
+        NotSupportedError,
+        ColumnsWithoutNamesError,
+        Warning,
     ):
         setattr(mod, cls.__name__, cls)
     monkeypatch.setitem(sys.modules, "pymssql", mod)
@@ -168,6 +188,44 @@ def test_is_transient_false_for_login_failures(
     """
     mod = _install_fake_pymssql(monkeypatch)
     assert SQLServerSource()._is_transient(mod.OperationalError(message)) is False
+
+
+def test_error_number_alone_cannot_classify_a_login_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Why the login check reads the message and not the error number.
+
+    Captured from a live SQL Server 2022. Both of these are OperationalError
+    and **both carry 18456 in args[0]** — the connection-refused case included,
+    because pymssql packs the whole DB-Lib conversation into args and the
+    login-failure number rides along:
+
+        auth failure : (18456, b"Login failed for user 'sa'.DB-Lib error
+                        message 20018 ... Adaptive Server connection failed")
+        refused      : (18456, b'DB-Lib error message 20009 ... Unable to
+                        connect: Adaptive Server is unavailable ...
+                        Connection refused (61)')
+
+    So a number-based check would answer *both* the same way: it cannot mark
+    the real auth failure without also killing the retry for a server that is
+    merely down. Only the message distinguishes them.
+    """
+    mod = _install_fake_pymssql(monkeypatch)
+    src = SQLServerSource()
+
+    auth = mod.OperationalError(
+        (18456, b"Login failed for user 'sa'.DB-Lib error message 20018, severity 14")
+    )
+    refused = mod.OperationalError(
+        (18456, b"DB-Lib error message 20009, severity 9:\nUnable to connect: "
+                b"Adaptive Server is unavailable or does not exist")
+    )
+
+    assert src._is_transient(auth) is False, "a wrong credential must not be retried"
+    assert src._is_transient(refused) is True, (
+        "a refused connection shares 18456 with the auth failure — classifying "
+        "on the number would have made a server restart unretryable"
+    )
 
 
 def test_is_transient_true_for_non_login_operational_errors(
@@ -367,3 +425,51 @@ class TestStreamingExtraction:
         conn = self._conn([])
         with patch.object(SQLServerSource, "_connect", return_value=conn):
             assert list(SQLServerSource().extract("SELECT 1", _profile())) == []
+def test_the_fake_exception_hierarchy_matches_the_real_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compare the double against the real driver, class by class.
+
+    Generalised from #861: a Databricks double had ``RequestError`` inheriting
+    from the wrong base, and that single difference made an auth-retry bug
+    structurally untestable — the mocked suite stayed green while a real 401
+    was retried three times. Every optional-driver source is tested against a
+    hand-written double, so a double that drifts produces confidently green
+    tests for broken code.
+
+    Asserting the *real* hierarchy alone would not catch that: the double is
+    what the other tests actually run against, so the two have to be compared
+    directly. Skips in CI's default matrix (no extras) — a backstop, not the
+    primary guard.
+    """
+    pymssql = pytest.importorskip("pymssql")
+    fake = _install_fake_pymssql(monkeypatch)
+
+    # Enumerated from the real module rather than hardcoded (@Muawiya-contact
+    # on #862): a literal list is the same drift surface one level up — it
+    # silently stops covering anything the driver adds, and a *new* class
+    # re-parented under OperationalError would start being retried with the
+    # pin unable to see it.
+    real_names = sorted(
+        n
+        for n, obj in vars(pymssql).items()
+        if isinstance(obj, type) and issubclass(obj, BaseException) and not n.startswith("_")
+    )
+    assert real_names, "found no exception classes — did pymssql move them?"
+
+    missing = [n for n in real_names if getattr(fake, n, None) is None]
+    assert not missing, (
+        f"the double is missing {missing} — the driver defines exception classes "
+        f"the double does not, so anything raising them is untested here"
+    )
+
+    for name in real_names:
+        real_cls, fake_cls = getattr(pymssql, name), getattr(fake, name)
+
+        real_bases = [b.__name__ for b in real_cls.__mro__[1:] if b is not object]
+        fake_bases = [b.__name__ for b in fake_cls.__mro__[1:] if b is not object]
+        assert fake_bases == real_bases, (
+            f"the double's {name} has bases {fake_bases} but the driver says "
+            f"{real_bases} — every classification test here is running against "
+            f"a hierarchy the driver does not have"
+        )

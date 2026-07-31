@@ -132,6 +132,7 @@ def _install_fake_ch_exceptions(monkeypatch: pytest.MonkeyPatch) -> Any:
     InternalError / NotSupportedError as siblings under DatabaseError, and
     StreamClosedError under ProgrammingError.
     """
+    import builtins
     import sys
     import types
 
@@ -162,6 +163,30 @@ def _install_fake_ch_exceptions(monkeypatch: pytest.MonkeyPatch) -> Any:
     class StreamClosedError(ProgrammingError):
         pass
 
+    # Added in #862 once the pin enumerated the real module instead of a
+    # hand-kept list, which is exactly how their absence surfaced.
+    # StreamFailureError and StreamCompleteException descend from plain
+    # Exception rather than DatabaseError — worth mirroring precisely, since
+    # re-parenting either under OperationalError is what would silently start
+    # retrying a stream failure.
+    class InternalError(DatabaseError):
+        pass
+
+    class NotSupportedError(DatabaseError):
+        pass
+
+    class StreamCompleteException(Exception):
+        pass
+
+    class StreamFailureError(Exception):
+        pass
+
+    # The driver's Warning subclasses the *builtin* Warning as well as its own
+    # base. Referenced via `builtins` because defining a class named Warning in
+    # this scope makes the bare name local.
+    class Warning(builtins.Warning, ClickHouseError):  # noqa: A001 - mirrors the driver
+        pass
+
     exc_mod = types.ModuleType("clickhouse_connect.driver.exceptions")
     for cls in (
         ClickHouseError,
@@ -173,6 +198,11 @@ def _install_fake_ch_exceptions(monkeypatch: pytest.MonkeyPatch) -> Any:
         DataError,
         IntegrityError,
         StreamClosedError,
+        InternalError,
+        NotSupportedError,
+        StreamCompleteException,
+        StreamFailureError,
+        Warning,
     ):
         setattr(exc_mod, cls.__name__, cls)
 
@@ -303,10 +333,12 @@ class TestClickHouseSourceRetry:
 class TestStreamingExtraction:
     """#765 slice 3: ClickHouse streams via query_rows_stream().
 
-    Measured on a live ClickHouse 24, 300k rows x ~200B: ``client.query()``
-    peaked at +221.7 MB RSS (it materialises every row into
-    ``result.result_rows``), ``query_rows_stream()`` at +0.0 MB — the largest
-    gap of any source in this issue.
+    Measured on a live ClickHouse 24, 300k rows x ~200B, each variant in a
+    fresh process: ``client.query()`` peaked at +224 MB RSS (it materialises
+    every row into ``result.result_rows``), ``query_rows_stream()`` at
+    +149 MB. The remainder is clickhouse-connect buffering the HTTP response
+    internally, not drt holding rows — a far smaller gap than the Postgres or
+    MySQL legs, and deliberately reported as-is.
     """
 
     def test_uses_query_rows_stream_not_query(self) -> None:
@@ -367,3 +399,55 @@ class TestStreamingExtraction:
 
         assert len(clients) == 1
         clients[0].close.assert_called_once()
+def test_the_fake_exception_hierarchy_matches_the_real_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compare the double against the real driver, class by class.
+
+    Generalised from #861: a Databricks double had ``RequestError`` inheriting
+    from the wrong base, and that single difference made an auth-retry bug
+    structurally untestable — the mocked suite stayed green while a real 401
+    was retried three times. Every optional-driver source is tested against a
+    hand-written double, so a double that drifts produces confidently green
+    tests for broken code.
+
+    Asserting the *real* hierarchy alone would not catch that: the double is
+    what the other tests actually run against, so the two have to be compared
+    directly.
+
+    The class list is **enumerated from the real module**, not hardcoded
+    (@Muawiya-contact on #862). A literal list is the same drift surface one
+    level up: it silently stops covering anything the driver adds, and the
+    dangerous case is a *new* class re-parented under ``OperationalError``,
+    which would start being retried with the pin unable to see it. Enumerating
+    means a new driver exception is covered the day it appears.
+
+    This runs for real in CI — ``ci.yml`` installs the ``clickhouse`` extra
+    precisely so these suites are not silently skipped.
+    """
+    real = pytest.importorskip("clickhouse_connect.driver.exceptions")
+    fake = _install_fake_ch_exceptions(monkeypatch)
+
+    # Every exception class the real module defines, not a hand-kept list.
+    real_names = sorted(
+        n
+        for n, obj in vars(real).items()
+        if isinstance(obj, type) and issubclass(obj, BaseException) and not n.startswith("_")
+    )
+    assert real_names, "found no exception classes — did the module move?"
+
+    missing = [n for n in real_names if getattr(fake, n, None) is None]
+    assert not missing, (
+        f"the double is missing {missing} — the driver defines exception classes "
+        f"the double does not, so anything raising them is untested here"
+    )
+
+    for name in real_names:
+        real_cls, fake_cls = getattr(real, name), getattr(fake, name)
+        real_bases = [b.__name__ for b in real_cls.__mro__[1:] if b is not object]
+        fake_bases = [b.__name__ for b in fake_cls.__mro__[1:] if b is not object]
+        assert fake_bases == real_bases, (
+            f"the double's {name} has bases {fake_bases} but the driver says "
+            f"{real_bases} — every classification test here is running against "
+            f"a hierarchy the driver does not have"
+        )
