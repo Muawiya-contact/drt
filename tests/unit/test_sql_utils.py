@@ -77,12 +77,16 @@ def test_upsert_key_message_is_stable() -> None:
 
 
 def test_unsupported_tracked_scope_message_names_dialect() -> None:
-    """databricks (not snowflake/clickhouse, both now supported by #692) — a
-    dialect this message still actually rejects."""
-    msg = unsupported_tracked_scope_msg("databricks")
+    """#692 closed out tracked/scope support on every SQL destination that
+    implements mirror mode (postgres, mysql, snowflake, clickhouse,
+    databricks), so no live call site passes ``supports_tracked_scope=False``
+    anymore. This exercises the message's string formatting directly with a
+    placeholder for whatever future dialect might add mirror mode without
+    tracked/scope from day one."""
+    msg = unsupported_tracked_scope_msg("newdialect")
     assert msg == (
-        "mirror.strategy: tracked / mirror.scope are not yet supported on databricks "
-        "(supported: postgres, mysql, snowflake, clickhouse — see #692 follow-ups)."
+        "mirror.strategy: tracked / mirror.scope are not yet supported on newdialect "
+        "(supported: postgres, mysql, snowflake, clickhouse, databricks)."
     )
 
 
@@ -114,13 +118,15 @@ def test_check_mirror_supported_requires_upsert_key() -> None:
 
 
 def test_check_mirror_supported_rejects_tracked_and_scope() -> None:
-    """databricks — the one dialect still genuinely rejected (not passing
-    ``supports_tracked_scope=True``, which every real caller here does)."""
+    """#692 closed out every real dialect (see the message test above), so
+    no live call site passes ``supports_tracked_scope=False`` for
+    tracked/scope anymore — this exercises the rejection branch directly
+    with a placeholder dialect that never opts in."""
     cfg = SimpleNamespace(upsert_key=["id"])
-    with pytest.raises(ValueError, match="not yet supported on databricks"):
-        check_mirror_supported(cfg, _mirror_opts(strategy="tracked"), "databricks")
-    with pytest.raises(ValueError, match="not yet supported on databricks"):
-        check_mirror_supported(cfg, _mirror_opts(scope=["parent_id"]), "databricks")
+    with pytest.raises(ValueError, match="not yet supported on newdialect"):
+        check_mirror_supported(cfg, _mirror_opts(strategy="tracked"), "newdialect")
+    with pytest.raises(ValueError, match="not yet supported on newdialect"):
+        check_mirror_supported(cfg, _mirror_opts(scope=["parent_id"]), "newdialect")
 
 
 def test_check_mirror_supported_ok_for_plain_mirror() -> None:
@@ -128,8 +134,9 @@ def test_check_mirror_supported_ok_for_plain_mirror() -> None:
 
 
 def test_check_mirror_supported_allows_tracked_and_scope_when_dialect_opts_in() -> None:
-    """#692 — a dialect passing supports_tracked_scope=True (Snowflake) is
-    not rejected the way clickhouse/databricks still are."""
+    """#692 — a dialect passing supports_tracked_scope=True (every real
+    dialect implementing mirror mode, as of Databricks landing) is not
+    rejected the way an unopted-in dialect still is."""
     cfg = SimpleNamespace(upsert_key=["id"])
     check_mirror_supported(
         cfg, _mirror_opts(strategy="tracked"), "snowflake", supports_tracked_scope=True

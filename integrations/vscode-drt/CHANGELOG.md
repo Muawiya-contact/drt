@@ -15,7 +15,6 @@ drt-core version its bundled schemas were generated from.
 - Bundled JSON Schemas regenerated from drt-core: `drt_project.yml` now validates
   the `query_tagging` block (`enabled`, `extra`) for cost-attribution query
   tagging (drt-hub/drt#768).
-
 ## [0.1.9] - Unreleased
 
 - Bundled JSON Schemas regenerated from drt-core: `syncs/*.yml` now validates a
