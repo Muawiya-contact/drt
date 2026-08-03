@@ -596,6 +596,21 @@ class SnowflakeDestination:
         WARN. Rows the application wrote are never candidates for deletion
         because they were never in the tracked set.
 
+        Unlike Postgres/MySQL, the target DELETE, the state DELETE, and the
+        state INSERT here are **not** one transaction — this Snowflake
+        connection autocommits by default (same as the replace-swap path
+        elsewhere in this file), and nothing here turns autocommit off. A
+        failure between the state DELETE and the state INSERT can leave
+        this sync's state partial. In the common case this still degrades
+        safely (an empty/partial ``previous`` next run reads as "no prior
+        state," triggering the baseline WARN above rather than a wrong
+        delete), but it isn't the code-level guarantee the shared
+        ``BaseSqlDestination`` docstring describes for Postgres/MySQL —
+        caught in review; not fixed here since it would mean wrapping every
+        statement in this method in an explicit
+        ``conn.autocommit(False)``/``conn.commit()`` pair, a larger change
+        than this docstring correction.
+
         ``mirror.scope`` + ``strategy: tracked`` (#694 part 1) prunes both
         the state read and the state rewrite to the observed scope — see
         ``BaseSqlDestination._finalize_mirror_tracked`` for the full
@@ -607,13 +622,17 @@ class SnowflakeDestination:
         table and ``previous - current`` is computed with a ``NOT EXISTS``
         join against ``_drt_synced_keys`` in SQL, so a state table with
         millions of rows never gets read into Python just to compute a
-        typically-small diff. Scope-filtering happens in Python afterward,
-        on the (small) diff — mathematically equivalent to filtering the
-        full previous set by scope first, since scope membership and
-        current-membership are independent conditions. The old
-        "read every untouched row so it can be reinserted unchanged" step
-        is gone: untouched rows are simply never selected by either the
-        diff query or the new-keys query.
+        typically-small diff — **for unscoped tracked mirror**. Scope-
+        filtering happens in Python afterward, on the diff — mathematically
+        equivalent to filtering the full previous set by scope first, since
+        scope membership and current-membership are independent conditions
+        — but the diff itself isn't scope-narrowed in SQL, so a scoped run
+        touching one of many historically-tracked scopes doesn't get the
+        same memory win (#890; see
+        ``BaseSqlDestination._finalize_mirror_tracked`` for the full
+        caveat). The old "read every untouched row so it can be reinserted
+        unchanged" step is gone: untouched rows are simply never selected
+        by either the diff query or the new-keys query.
         """
         import logging
 
