@@ -258,6 +258,131 @@ async def test_run_test_severity_warn_exception_does_not_flip_status(
     assert result["status"] == "passed"
 
 
+@pytest.mark.asyncio
+async def test_run_test_error_severity_failure_flips_status(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The other half of the severity rule: a default-severity failure MUST
+    flip the top-level status. Without this, `status: "passed"` could be
+    hardcoded and the two warn tests above would still pass."""
+    (tmp_path / "drt_project.yml").write_text("name: test\nprofile: default\n")
+    syncs_dir = tmp_path / "syncs"
+    syncs_dir.mkdir()
+    (syncs_dir / "orders.yml").write_text(
+        "name: orders\n"
+        "model: ref('orders')\n"
+        "destination:\n"
+        "  type: postgres\n"
+        "  host: localhost\n"
+        "  dbname: test\n"
+        "  table: orders\n"
+        "  upsert_key: [id]\n"
+        "tests:\n"
+        "  - not_null: { columns: [email] }\n"
+    )
+    from drt.destinations import query as query_module
+
+    monkeypatch.setattr(query_module, "is_queryable", lambda d: True)
+    monkeypatch.setattr(query_module, "get_table_name", lambda d: "orders")
+    monkeypatch.setattr(query_module, "execute_test_query", lambda d, q: 3)  # 3 nulls -> fails
+
+    srv = create_server(tmp_path)
+    result = await call(srv, "drt_run_test")
+
+    test_entry = result["results"][0]["tests"][0]
+    assert test_entry == {
+        "name": "not_null(email)",
+        "passed": False,
+        "value": "3",
+        "severity": "error",
+    }
+    assert result["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_run_test_writes_nothing_to_the_console(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    """#851: the tool now runs the same execution path as `drt test`, which
+    prints a header + a line per test. MCP speaks over stdio — a stray print
+    corrupts the transport, so the tool must stay silent on both the pass
+    and the skip path."""
+    (tmp_path / "drt_project.yml").write_text("name: test\nprofile: default\n")
+    syncs_dir = tmp_path / "syncs"
+    syncs_dir.mkdir()
+    (syncs_dir / "orders.yml").write_text(
+        "name: orders\n"
+        "model: ref('orders')\n"
+        "destination:\n"
+        "  type: postgres\n"
+        "  host: localhost\n"
+        "  dbname: test\n"
+        "  table: orders\n"
+        "  upsert_key: [id]\n"
+        "tests:\n"
+        "  - not_null: { columns: [email] }\n"
+    )
+    # A second, non-queryable sync exercises the skip branch's printing too.
+    (syncs_dir / "notify.yml").write_text(
+        "name: notify\n"
+        "model: ref('users')\n"
+        "destination:\n"
+        "  type: rest_api\n"
+        "  url: https://example.com/hook\n"
+        "tests:\n"
+        "  - row_count: { min: 1 }\n"
+    )
+    from drt.destinations import query as query_module
+
+    monkeypatch.setattr(query_module, "get_table_name", lambda d: "orders")
+    monkeypatch.setattr(query_module, "execute_test_query", lambda d, q: 0)
+
+    srv = create_server(tmp_path)
+    capsys.readouterr()  # drop anything the fixtures above emitted
+    result = await call(srv, "drt_run_test")
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+    assert result["status"] == "passed"
+
+
+@pytest.mark.asyncio
+async def test_run_test_does_not_store_failure_samples(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """`--store-failures` (#779) writes .drt/test_failures/… to disk. The MCP
+    tool exposes no way to read a sample back, so it must not write one —
+    a failing test through MCP leaves the filesystem untouched (#851)."""
+    (tmp_path / "drt_project.yml").write_text("name: test\nprofile: default\n")
+    syncs_dir = tmp_path / "syncs"
+    syncs_dir.mkdir()
+    (syncs_dir / "orders.yml").write_text(
+        "name: orders\n"
+        "model: ref('orders')\n"
+        "destination:\n"
+        "  type: postgres\n"
+        "  host: localhost\n"
+        "  dbname: test\n"
+        "  table: orders\n"
+        "  upsert_key: [id]\n"
+        "tests:\n"
+        "  - not_null: { columns: [email] }\n"
+    )
+    from drt.destinations import query as query_module
+
+    monkeypatch.setattr(query_module, "is_queryable", lambda d: True)
+    monkeypatch.setattr(query_module, "get_table_name", lambda d: "orders")
+    monkeypatch.setattr(query_module, "execute_test_query", lambda d, q: 3)
+
+    srv = create_server(tmp_path)
+    result = await call(srv, "drt_run_test")
+
+    assert result["status"] == "failed"
+    assert not (tmp_path / ".drt" / "test_failures").exists()
+    assert "failures_stored" not in result["results"][0]["tests"][0]
+
+
 # ---------------------------------------------------------------------------
 # drt_get_status
 # ---------------------------------------------------------------------------
