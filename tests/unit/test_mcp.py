@@ -374,6 +374,13 @@ async def test_run_test_does_not_store_failure_samples(
     monkeypatch.setattr(query_module, "is_queryable", lambda d: True)
     monkeypatch.setattr(query_module, "get_table_name", lambda d: "orders")
     monkeypatch.setattr(query_module, "execute_test_query", lambda d, q: 3)
+    # Samples land under `project_dir` — which the tool resolves from the
+    # context, but which `execute_tests_for_sync` defaults to `Path(".")`.
+    # Pointing the cwd at tmp_path too means a regression on *either* — the
+    # store_failures flag or the project_dir argument — writes inside the tmp
+    # dir where the assertion below can see it, rather than silently into the
+    # repo checkout, where it would pass and leave a stray file behind.
+    monkeypatch.chdir(tmp_path)
 
     srv = create_server(tmp_path)
     result = await call(srv, "drt_run_test")
