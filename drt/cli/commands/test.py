@@ -179,7 +179,10 @@ def execute_tests_for_sync(
                     f"tests not supported for {sync.destination.type} destinations",
                 )
         sync_results["skipped"] = True
-        sync_results["reason"] = f"tests not supported for {sync.destination.type}"
+        # Same wording as the two printed variants above — and as the string
+        # `drt_run_test` has always returned (#851), so routing the MCP tool
+        # through this function keeps its `reason` field byte-identical.
+        sync_results["reason"] = f"tests not supported for {sync.destination.type} destinations"
         return sync_results, False
 
     table = get_table_name(sync.destination)
