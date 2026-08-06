@@ -51,6 +51,12 @@ def run_test(ctx: McpContext, sync_name: str | None = None) -> dict[str, Any]:
             # exposes no way to read a written sample back — nothing would
             # ever consume it (#851).
             store_failures=False,
+            # Unused while store_failures is False, but passed rather than
+            # left on the `Path(".")` default: an MCP server is created with
+            # an explicit project_dir and its process cwd is whatever the
+            # client happened to spawn it from. Everything else in this tool
+            # already resolves through `ctx` for that reason.
+            project_dir=ctx.project_dir,
         )
         results.append(sync_result)
         if sync_failed:
