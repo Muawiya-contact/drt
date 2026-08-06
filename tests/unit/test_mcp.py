@@ -342,8 +342,13 @@ async def test_run_test_writes_nothing_to_the_console(
     result = await call(srv, "drt_run_test")
 
     captured = capsys.readouterr()
+    # stdout only: `drt.cli.output.console` is a plain `Console()`, so that is
+    # where the CLI's test header and per-test lines would land, and stdout is
+    # the channel an MCP stdio server may not put non-protocol bytes on.
+    # stderr is the sanctioned place for a server to log — asserting it empty
+    # would turn any future warning from fastmcp / pydantic / a DB driver into
+    # a failure of a test about console leakage.
     assert captured.out == ""
-    assert captured.err == ""
     assert result["status"] == "passed"
 
 
