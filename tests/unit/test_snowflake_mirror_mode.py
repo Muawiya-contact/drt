@@ -75,6 +75,7 @@ def _configure_state_cur(
     to_insert: list[tuple[str, str]] | None = None,
     previous_exists: bool = True,
     table_exists: bool = True,
+    scope_key_of: dict[str, str | None] | None = None,
 ) -> None:
     """Configure a ``_fake_conn()``'s cursor to answer the #694 part 2 reads,
     dispatched by the most recent ``execute()`` call's SQL text — see the
@@ -82,6 +83,7 @@ def _configure_state_cur(
     the ``SHOW TABLES`` existence probe (Snowflake's own ``fetchall``-based
     check, unlike Postgres/MySQL's ``fetchone``-based one)."""
     cur = conn._cur
+    scope_key_of = scope_key_of or {}
 
     def fetchone_side_effect() -> Any:
         sql = cur.execute.call_args.args[0] if cur.execute.call_args.args else ""
@@ -94,7 +96,12 @@ def _configure_state_cur(
         if "SHOW TABLES" in sql:
             return [("_DRT_SYNCED_KEYS",)] if table_exists else []
         if "SELECT s.key_hash" in sql:
-            return list(raw_diff or [])
+            # #890: model the projection actually asked for — a scoped run adds
+            # scope_key as a third column so pre-#890 rows can be spotted.
+            rows = list(raw_diff or [])
+            if "s.scope_key" in sql:
+                return [(h, kj, scope_key_of.get(h)) for h, kj in rows]
+            return rows
         if "SELECT c.key_hash" in sql:
             return list(to_insert or [])
         return []
@@ -788,8 +795,20 @@ def test_tracked_scoped_deletes_only_stale_keys_within_observed_scope_snowflake(
     assert len(state_delete_calls) == 1
     deleted_hashes = {row[1] for row in state_delete_calls[0].args[1]}
     assert deleted_hashes == {key_hash((1, "b"))}
-    for call in finalize_conn._cur.executemany.call_args_list:
-        assert key_hash((2, "x")) not in str(call.args[1])
+    # #694 part 2 pinned that an out-of-scope row is never touched at all. #890
+    # narrows that: it may be touched *once*, by the scope backfill, and only
+    # while its scope columns are still NULL. It is still never deleted and
+    # never re-inserted, and once healed it is filtered out in SQL. Asserting
+    # the shape rather than dropping the check, so a future change that starts
+    # deleting or rewriting it still fails here.
+    touched = [
+        c
+        for c in finalize_conn._cur.executemany.call_args_list
+        if key_hash((2, "x")) in str(c.args[1])
+    ]
+    assert len(touched) <= 1
+    for call in touched:
+        assert "SET scope_spec" in str(call.args[0])
 
 
 def test_tracked_scoped_first_touch_of_a_scope_is_not_a_baseline_warning_snowflake(
@@ -850,3 +869,99 @@ def test_tracked_scoped_genuinely_no_prior_state_still_warns_baseline_snowflake(
         dest.finalize_sync(config, _tracked_scoped_options())
 
     assert any("baselin" in r.message.lower() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# #890 — scope-aware SQL diff (Snowflake leg; see #904 for the design)
+# ---------------------------------------------------------------------------
+
+
+def _scope_columns(conn: MagicMock, *, present: bool) -> None:
+    """Answer the #890 column probe on top of the shared state-cursor fake."""
+    cur = conn._cur
+    inner = cur.fetchone.side_effect
+
+    def fetchone(*a: Any, **k: Any) -> Any:
+        sql = cur.execute.call_args.args[0] if cur.execute.call_args.args else ""
+        if "information_schema.columns" in sql:
+            return (2 if present else 0,)
+        return inner()
+
+    cur.fetchone.side_effect = fetchone
+
+
+def _diff_call(conn: MagicMock) -> Any:
+    return next(
+        c
+        for c in conn._cur.execute.call_args_list
+        if c.args and str(c.args[0]).startswith("SELECT s.key_hash")
+    )
+
+
+def _run_scoped(monkeypatch: pytest.MonkeyPatch, finalize_conn: MagicMock) -> None:
+    _set_creds(monkeypatch)
+    dest = SnowflakeDestination()
+    config = _config(upsert_key=["parent_id", "id"])
+    with patch.dict("sys.modules", _mocked_snowflake_modules(_fake_conn())):
+        dest.load([{"parent_id": 1, "id": "a"}], config, _tracked_scoped_options())
+    with patch.dict("sys.modules", _mocked_snowflake_modules(finalize_conn)):
+        dest.finalize_sync(config, _tracked_scoped_options())
+
+
+def test_scoped_diff_is_narrowed_in_sql_snowflake(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = _fake_conn()
+    _configure_state_cur(conn, raw_diff=[], to_insert=[])
+    _scope_columns(conn, present=True)
+
+    _run_scoped(monkeypatch, conn)
+
+    sql, params = _diff_call(conn).args
+    assert "s.scope_key IN" in sql
+    # both escape branches present — they are what keep this a coarse filter
+    assert "s.scope_key IS NULL" in sql
+    assert "s.scope_spec <> %s" in sql
+    assert '["parent_id"]' in params and "[1]" in params
+
+
+def test_scoped_diff_falls_back_when_alter_is_refused_snowflake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ALTER privilege is a supported state, not an error.
+
+    Snowflake needs no SAVEPOINT for this the way Postgres/MySQL do — the
+    connection autocommits, so a refused ALTER leaves nothing half-applied.
+    """
+    conn = _fake_conn()
+    _configure_state_cur(conn, raw_diff=[], to_insert=[])
+    _scope_columns(conn, present=False)
+    real_execute = conn._cur.execute.side_effect
+
+    def execute(sql: str, *a: Any, **k: Any) -> Any:
+        if sql.startswith("ALTER TABLE") and "scope_spec" in sql:
+            raise Exception("insufficient privileges on table _DRT_SYNCED_KEYS")
+        return real_execute(sql, *a, **k) if real_execute else None
+
+    conn._cur.execute.side_effect = execute
+
+    _run_scoped(monkeypatch, conn)
+
+    assert "scope_key" not in str(_diff_call(conn).args[0])
+
+
+def test_unscoped_tracked_never_probes_scope_columns_snowflake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_creds(monkeypatch)
+    conn = _fake_conn()
+    _configure_state_cur(conn, raw_diff=[], to_insert=[])
+    dest = SnowflakeDestination()
+    with patch.dict("sys.modules", _mocked_snowflake_modules(_fake_conn())):
+        dest.load([{"id": 1}], _config(), _tracked_options())
+    with patch.dict("sys.modules", _mocked_snowflake_modules(conn)):
+        dest.finalize_sync(_config(), _tracked_options())
+
+    assert not any(
+        "information_schema.columns" in str(c.args[0])
+        for c in conn._cur.execute.call_args_list
+        if c.args
+    )
