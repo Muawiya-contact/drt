@@ -910,6 +910,7 @@ def _state_conn(
     to_insert: list[tuple[str, str]] | None = None,
     previous_exists: bool = True,
     exists: bool = True,
+    scope_key_of: dict[str, str | None] | None = None,
 ) -> MagicMock:
     """A fake connection wired for the #694 part 2 read path — ``SHOW
     TABLES``, a baseline existence probe, the SQL-side diff, and the
@@ -919,6 +920,7 @@ def _state_conn(
     server-side; ``to_insert`` is what ``current - previous`` would have."""
     conn = _fake_conn()
     cur = conn._cur
+    scope_key_of = scope_key_of or {}
 
     def fetchone_side_effect() -> Any:
         return (1,) if previous_exists else None
@@ -928,7 +930,12 @@ def _state_conn(
         if sql.startswith("SHOW TABLES"):
             return [("_drt_synced_keys",)] if exists else []
         if sql.startswith("SELECT s.key_hash"):
-            return list(raw_diff or [])
+            # #890: model the projection actually asked for — a scoped run adds
+            # scope_key as a third column so pre-#890 rows can be spotted.
+            rows = list(raw_diff or [])
+            if "s.scope_key" in sql:
+                return [(h, kj, scope_key_of.get(h)) for h, kj in rows]
+            return rows
         if sql.startswith("SELECT c.key_hash"):
             return list(to_insert or [])
         return []
@@ -1227,7 +1234,15 @@ def test_tracked_scoped_deletes_only_stale_keys_within_observed_scope_databricks
     ]
     assert len(state_delete_calls) == 1
     assert state_delete_calls[0].args[1] == ["scores_sync", key_hash((1, "b"))]
-    assert not any(c.args and key_hash((2, "x")) in c.args[1] for c in calls if len(c.args) > 1)
+    # #694 part 2 pinned that an out-of-scope row is never touched at all. #890
+    # narrows that: it may be touched *once*, by the scope backfill, and only
+    # while its scope columns are still NULL. It is still never deleted and
+    # never re-inserted, and once healed it is filtered out in SQL. Asserting
+    # the shape rather than dropping the check.
+    touched = [c for c in calls if len(c.args) > 1 and key_hash((2, "x")) in c.args[1]]
+    assert len(touched) <= 1
+    for call in touched:
+        assert "SET scope_spec" in str(call.args[0])
     assert not any(
         c.args and c.args[0].startswith("INSERT INTO main.default._drt_synced_keys") for c in calls
     )
@@ -1266,7 +1281,17 @@ def test_tracked_scoped_first_touch_of_a_scope_is_not_a_baseline_warning_databri
         if c.args and c.args[0].startswith("INSERT INTO main.default._drt_synced_keys")
     ]
     assert len(insert_calls) == 1
-    assert insert_calls[0].args[1] == ["scores_sync", key_hash((1, "a")), key_json((1, "a"))]
+    # A scoped run now also records the scope it was computed under (#890), so
+    # the row carries five values rather than three. The first three are what
+    # this test has always been about; the last two are asserted here so the
+    # widening is deliberate rather than absorbed silently.
+    assert insert_calls[0].args[1] == [
+        "scores_sync",
+        key_hash((1, "a")),
+        key_json((1, "a")),
+        '["parent_id"]',
+        "[1]",
+    ]
 
 
 def test_tracked_scoped_genuinely_no_prior_state_still_warns_baseline_databricks(
@@ -1412,3 +1437,94 @@ class TestDatabricksChunkedInserts:
         # …and every key is staged exactly once.
         staged = [v for c in key_inserts for v in c.args[1]]
         assert sorted(staged) == list(range(300))
+
+
+# ---------------------------------------------------------------------------
+# #890 — scope-aware SQL diff (Databricks leg; design lives on #904)
+# ---------------------------------------------------------------------------
+
+
+def _scope_columns(conn: MagicMock, *, present: bool) -> None:
+    """Answer the #890 information_schema probe on top of the state-conn fake."""
+    cur = conn._cur
+    inner = cur.fetchone.side_effect
+
+    def fetchone(*a: Any, **k: Any) -> Any:
+        sql = cur.execute.call_args.args[0] if cur.execute.call_args.args else ""
+        if "information_schema.columns" in sql:
+            return (2 if present else 0,)
+        return inner()
+
+    cur.fetchone.side_effect = fetchone
+
+
+def _diff_call(conn: MagicMock) -> Any:
+    return next(
+        c
+        for c in conn._cur.execute.call_args_list
+        if c.args and str(c.args[0]).startswith("SELECT s.key_hash")
+    )
+
+
+def _run_scoped(finalize_conn: MagicMock) -> None:
+    dest = DatabricksDestination()
+    config = _config(upsert_key=["parent_id", "id"])
+    with patch.object(DatabricksDestination, "_connect", return_value=_fake_conn()):
+        dest.load([{"parent_id": 1, "id": "a"}], config, _tracked_scoped_options())
+    with patch.object(DatabricksDestination, "_connect", return_value=finalize_conn):
+        dest.finalize_sync(config, _tracked_scoped_options())
+
+
+def test_scoped_diff_is_narrowed_in_sql_databricks() -> None:
+    conn = _state_conn(raw_diff=[], to_insert=[])
+    _scope_columns(conn, present=True)
+
+    _run_scoped(conn)
+
+    sql, params = _diff_call(conn).args
+    assert "s.scope_key IN" in sql
+    # both escape branches — what keeps this a purely coarse filter
+    assert "s.scope_key IS NULL" in sql
+    assert "s.scope_spec <> ?" in sql
+    assert params == ["scores_sync", '["parent_id"]', "[1]"]
+
+
+def test_scoped_diff_falls_back_when_alter_is_refused_databricks() -> None:
+    """No ALTER privilege is a supported state, not an error.
+
+    Delta spells the DDL ``ADD COLUMNS (...)`` — plural and parenthesised,
+    unlike every other leg's ``ADD COLUMN`` — so this also pins that the
+    statement drt emits is the one Databricks actually accepts.
+    """
+    conn = _state_conn(raw_diff=[], to_insert=[])
+    _scope_columns(conn, present=False)
+    attempted: list[str] = []
+
+    def execute(sql: str, *a: Any, **k: Any) -> Any:
+        if sql.startswith("ALTER TABLE") and "scope_spec" in sql:
+            attempted.append(sql)
+            raise Exception("PERMISSION_DENIED: does not have MODIFY on table")
+        return None
+
+    conn._cur.execute.side_effect = execute
+
+    _run_scoped(conn)
+
+    assert attempted and "ADD COLUMNS (scope_spec STRING, scope_key STRING)" in attempted[0]
+    assert "scope_key" not in str(_diff_call(conn).args[0])
+
+
+def test_unscoped_tracked_never_probes_scope_columns_databricks() -> None:
+    conn = _state_conn(raw_diff=[], to_insert=[])
+    dest = DatabricksDestination()
+    config = _config(upsert_key=["id"])
+    with patch.object(DatabricksDestination, "_connect", return_value=_fake_conn()):
+        dest.load([{"id": 1}], config, _tracked_options())
+    with patch.object(DatabricksDestination, "_connect", return_value=conn):
+        dest.finalize_sync(config, _tracked_options())
+
+    assert not any(
+        "information_schema.columns" in str(c.args[0])
+        for c in conn._cur.execute.call_args_list
+        if c.args
+    )
