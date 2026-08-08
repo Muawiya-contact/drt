@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from collections.abc import Iterator
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -26,7 +28,8 @@ from drt.config.secret_providers.vault import VaultProvider, _split_kv2_path
 
 
 @pytest.fixture(autouse=True)
-def _clear_provider_cache() -> Iterator[None]:
+def _clear_provider_cache(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    monkeypatch.delenv("DRT_SECRET_CACHE_TTL_SECONDS", raising=False)
     clear_cache()
     yield
     clear_cache()
@@ -166,13 +169,71 @@ class TestRegistry:
         assert resolve_provider_uri(f"{scheme}://a/b#c") == "the-secret"
         provider.fetch.assert_called_once_with(SecretRef(path="a/b", key="c"))
 
-    def test_result_is_cached_across_calls(self, _fake_provider: tuple[str, MagicMock]) -> None:
+    def test_result_is_cached_before_ttl_expiry(
+        self, monkeypatch: pytest.MonkeyPatch, _fake_provider: tuple[str, MagicMock]
+    ) -> None:
         scheme, provider = _fake_provider
         provider.fetch.return_value = "cached-value"
+        monotonic = MagicMock(return_value=100.0)
+        monkeypatch.setattr(sp_base.time, "monotonic", monotonic)
+        monkeypatch.setenv("DRT_SECRET_CACHE_TTL_SECONDS", "300")
 
         assert resolve_provider_uri(f"{scheme}://x") == "cached-value"
+        monotonic.return_value = 399.0
         assert resolve_provider_uri(f"{scheme}://x") == "cached-value"
         provider.fetch.assert_called_once()
+
+    def test_result_is_refetched_after_ttl_expiry(
+        self, monkeypatch: pytest.MonkeyPatch, _fake_provider: tuple[str, MagicMock]
+    ) -> None:
+        scheme, provider = _fake_provider
+        provider.fetch.side_effect = ["initial-value", "rotated-value"]
+        monotonic = MagicMock(return_value=100.0)
+        monkeypatch.setattr(sp_base.time, "monotonic", monotonic)
+        monkeypatch.setenv("DRT_SECRET_CACHE_TTL_SECONDS", "300")
+
+        assert resolve_provider_uri(f"{scheme}://x") == "initial-value"
+        monotonic.return_value = 400.1
+        assert resolve_provider_uri(f"{scheme}://x") == "rotated-value"
+        assert provider.fetch.call_count == 2
+
+    def test_concurrent_cache_misses_fetch_once(
+        self, _fake_provider: tuple[str, MagicMock]
+    ) -> None:
+        scheme, provider = _fake_provider
+        worker_count = 8
+        barrier = threading.Barrier(worker_count)
+        results: list[str | None] = [None] * worker_count
+
+        def slow_fetch(ref: SecretRef) -> str:
+            time.sleep(0.05)
+            return "shared-value"
+
+        def resolve(index: int) -> None:
+            barrier.wait()
+            results[index] = resolve_provider_uri(f"{scheme}://x")
+
+        provider.fetch.side_effect = slow_fetch
+        threads = [threading.Thread(target=resolve, args=(i,)) for i in range(worker_count)]
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert results == ["shared-value"] * worker_count
+        provider.fetch.assert_called_once_with(SecretRef(path="x", key=None))
+
+    def test_non_positive_ttl_disables_caching(
+        self, monkeypatch: pytest.MonkeyPatch, _fake_provider: tuple[str, MagicMock]
+    ) -> None:
+        scheme, provider = _fake_provider
+        provider.fetch.side_effect = ["initial-value", "rotated-value"]
+        monkeypatch.setenv("DRT_SECRET_CACHE_TTL_SECONDS", "0")
+
+        assert resolve_provider_uri(f"{scheme}://x") == "initial-value"
+        assert resolve_provider_uri(f"{scheme}://x") == "rotated-value"
+        assert provider.fetch.call_count == 2
 
     def test_different_uris_are_cached_independently(
         self, _fake_provider: tuple[str, MagicMock]
