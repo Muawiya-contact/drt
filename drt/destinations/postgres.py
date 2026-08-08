@@ -386,7 +386,30 @@ class PostgresDestination(BaseSqlDestination):
                 "sync_name VARCHAR(255) NOT NULL, "
                 "key_hash CHAR(64) NOT NULL, "
                 "key_json TEXT NOT NULL, "
+                "scope_spec TEXT, "
+                "scope_key TEXT, "
                 "PRIMARY KEY (sync_name, key_hash))"
+            ).format(ident)
+        )
+
+    def _state_scope_columns_exist(self, cur: Any, scope: Any, raw: str) -> bool:
+        cur.execute(
+            "SELECT COUNT(*) FROM pg_attribute "
+            "WHERE attrelid = to_regclass(%s) "
+            "AND attname IN ('scope_spec', 'scope_key') "
+            "AND NOT attisdropped",
+            (raw,),
+        )
+        row = cur.fetchone()
+        return bool(row is not None and row[0] == 2)
+
+    def _add_state_scope_columns(self, cur: Any, ident: Any) -> None:
+        from psycopg2 import sql as _pgsql
+
+        cur.execute(
+            _pgsql.SQL(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS scope_spec TEXT, "
+                "ADD COLUMN IF NOT EXISTS scope_key TEXT"
             ).format(ident)
         )
 

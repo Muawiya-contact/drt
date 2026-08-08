@@ -469,6 +469,27 @@ class BaseSqlDestination:
         (``Composable`` vs ``str``), which is why this is a hook."""
         raise NotImplementedError
 
+    def _state_scope_columns_exist(self, cur: Any, scope: Any, raw: str) -> bool:
+        """Do the #890 ``scope_spec`` / ``scope_key`` columns exist yet?
+
+        Separate probe from ``_state_table_exists`` because a state table
+        created before #890 is perfectly valid and must keep working — it just
+        cannot be filtered server-side until the columns are added. Dialect
+        hook for the same reason the table probe is one: a locked-down user
+        must never see DDL it has no privilege for.
+        """
+        raise NotImplementedError
+
+    def _add_state_scope_columns(self, cur: Any, ident: Any) -> None:
+        """``ALTER TABLE ... ADD COLUMN`` for the #890 scope columns.
+
+        Both nullable and without a default, which is a metadata-only change on
+        every engine drt targets — no rewrite of an existing state table
+        however large. May legitimately fail (no ALTER privilege, the #695
+        family); the caller treats that as "stay on the Python-only filter".
+        """
+        raise NotImplementedError
+
     def _state_sql(self, template: str, ident: Any) -> Any:
         """Bind ``ident`` into a single-``{}`` SQL ``template``, returning
         something ``cursor.execute`` accepts.
@@ -592,10 +613,13 @@ class BaseSqlDestination:
 
         from drt.destinations._mirror_state import (
             DIFF_STAGING_TABLE,
+            SCOPE_BACKFILL_PER_RUN,
             STATE_TABLE,
             decode_key,
             key_hash,
             key_json,
+            scope_key_json,
+            scope_spec_json,
         )
 
         sync_name = sync_options._sync_name or config.table
@@ -615,8 +639,34 @@ class BaseSqlDestination:
             # a state table an admin created ahead of time. Only CREATE when the
             # table is genuinely absent — the IF NOT EXISTS guard stays for the
             # concurrent-first-run race.
-            if not self._state_table_exists(cur, state_scope, state_raw):
+            fresh_table = not self._state_table_exists(cur, state_scope, state_raw)
+            if fresh_table:
                 self._create_state_table(cur, state_ident)
+
+            # #890: the scope columns let the diff be filtered server-side.
+            # Only ever probed for a scoped run — an unscoped sync has nothing
+            # to gain and must not pay a probe, let alone DDL, for it.
+            scope_spec = scope_spec_json(list(scope_cols)) if scope_cols else None
+            scope_sql = False
+            if scope_positions is not None:
+                if fresh_table:
+                    scope_sql = True  # created with the columns
+                elif self._state_scope_columns_exist(cur, state_scope, state_raw):
+                    scope_sql = True
+                else:
+                    # A state table from before #890. Adding the columns is
+                    # metadata-only, but the privilege to do it is not
+                    # guaranteed (#695) — so this is attempted inside a
+                    # savepoint and a refusal simply leaves the run on the
+                    # Python-only filter, permanently and without an error.
+                    cur.execute("SAVEPOINT drt_scope_cols")
+                    try:
+                        self._add_state_scope_columns(cur, state_ident)
+                    except Exception:  # noqa: BLE001 — no ALTER privilege is a supported state
+                        cur.execute("ROLLBACK TO SAVEPOINT drt_scope_cols")
+                    else:
+                        cur.execute("RELEASE SAVEPOINT drt_scope_cols")
+                        scope_sql = True
 
             # Baseline check (#694 part 2): a cheap existence probe, never a
             # full read — the only thing this needs to know is "has this sync
@@ -649,16 +699,40 @@ class BaseSqlDestination:
                     [(key_hash(k), key_json(k)) for k in current],
                 )
 
-            cur.execute(
-                self._state_sql(
-                    "SELECT s.key_hash, s.key_json FROM {} s WHERE s.sync_name = %s "
-                    f"AND NOT EXISTS (SELECT 1 FROM {DIFF_STAGING_TABLE} c "
-                    "WHERE c.key_hash = s.key_hash)",
-                    state_ident,
-                ),
-                (sync_name,),
+            # #890: narrow `previous` to the observed scopes *in SQL* when the
+            # columns are available. Three branches, and the first two are what
+            # keep this a purely *coarse* filter — every row they let through is
+            # re-checked exactly by the Python filter below:
+            #   scope_key IS NULL   → written before the columns existed
+            #   scope_spec <> ...   → written under a different `mirror.scope`,
+            #                         so its frozen scope_key means nothing here
+            # Without the second branch, editing `mirror.scope` would strand
+            # every previously written row: no observed scope matches its stale
+            # scope_key, so it drops out of the diff and stops being a deletion
+            # candidate silently and forever.
+            projection = (
+                "s.key_hash, s.key_json, s.scope_key" if scope_sql else "s.key_hash, s.key_json"
             )
-            raw_diff = cur.fetchall()
+            diff_sql = (
+                f"SELECT {projection} FROM {{}} s WHERE s.sync_name = %s "
+                f"AND NOT EXISTS (SELECT 1 FROM {DIFF_STAGING_TABLE} c "
+                "WHERE c.key_hash = s.key_hash)"
+            )
+            diff_params: tuple[Any, ...] = (sync_name,)
+            if scope_sql and observed_scopes:
+                observed_json = sorted(key_json(sc) for sc in observed_scopes)
+                placeholders = ", ".join(["%s"] * len(observed_json))
+                diff_sql += (
+                    " AND (s.scope_key IS NULL OR s.scope_spec <> %s "
+                    f"OR s.scope_key IN ({placeholders}))"
+                )
+                diff_params = (sync_name, scope_spec, *observed_json)
+            cur.execute(self._state_sql(diff_sql, state_ident), diff_params)
+            fetched = cur.fetchall()
+            stale_scope = (
+                [(h, kj) for h, kj, sk in fetched if sk is None] if scope_sql else []
+            )
+            raw_diff = [row[:2] for row in fetched]
 
             # Scope-filtering the (small) diff after the SQL-side subtraction
             # is equivalent to filtering `previous` by scope *before*
@@ -676,6 +750,45 @@ class BaseSqlDestination:
                 ]
             else:
                 to_delete = [decode_key(kj) for _h, kj in raw_diff]
+
+            # #890 backfill. Rows tracked before the scope columns existed are
+            # never rewritten by the state pass — #694 part 2 deliberately
+            # leaves an already-tracked row alone, which is what makes the diff
+            # cheap — so without this they would keep their NULL scope forever
+            # and keep falling through to the Python filter. On an upgraded
+            # state table that means the optimisation never engages at all.
+            #
+            # The rows are already here: fetched, decoded, and their scope
+            # already computed for the filter above. Healing them costs one
+            # UPDATE. Capped per run because the expand/contract guidance is to
+            # backfill in batches rather than in one pass inside the hot path,
+            # and a sync run is the hot path — the table converges over a few
+            # runs instead of one run paying for the whole history.
+            #
+            # Rows about to be deleted are skipped: writing a scope onto a row
+            # that goes away two statements later is pure waste.
+            if stale_scope and scope_positions is not None:
+                doomed = {key_hash(k) for k in to_delete}
+                heal = [(h, kj) for h, kj in stale_scope if h not in doomed][
+                    :SCOPE_BACKFILL_PER_RUN
+                ]
+                if heal:
+                    cur.executemany(
+                        self._state_sql(
+                            "UPDATE {} SET scope_spec = %s, scope_key = %s "
+                            "WHERE sync_name = %s AND key_hash = %s",
+                            state_ident,
+                        ),
+                        [
+                            (
+                                scope_spec,
+                                scope_key_json(decode_key(kj), scope_positions),
+                                sync_name,
+                                h,
+                            )
+                            for h, kj in heal
+                        ],
+                    )
 
             if to_delete:
                 stmt, params = self._build_mirror_delete(
@@ -730,7 +843,27 @@ class BaseSqlDestination:
                 (sync_name,),
             )
             to_insert = cur.fetchall()
-            if to_insert:
+            if to_insert and scope_sql and scope_positions is not None:
+                cur.executemany(
+                    self._state_sql(
+                        "INSERT INTO {} (sync_name, key_hash, key_json, scope_spec, scope_key) "
+                        "VALUES (%s, %s, %s, %s, %s)",
+                        state_ident,
+                    ),
+                    [
+                        (
+                            sync_name,
+                            h,
+                            kj,
+                            scope_spec,
+                            scope_key_json(decode_key(kj), scope_positions),
+                        )
+                        for h, kj in to_insert
+                    ],
+                )
+            elif to_insert:
+                # Unscoped sync, or scope columns unavailable — the columns stay
+                # NULL, which the predicate above always lets through.
                 cur.executemany(
                     self._state_sql(
                         "INSERT INTO {} (sync_name, key_hash, key_json) "
