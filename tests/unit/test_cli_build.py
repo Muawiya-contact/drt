@@ -65,6 +65,8 @@ class _FakeResult:
         self.limit_applied: int | None = None
         self.duration_seconds = 0.01
         self.interrupted = False
+        self.run_id: str | None = None
+        self.sync_run_id: str | None = "fake-sync-run-id"
 
 
 @pytest.fixture
@@ -122,6 +124,19 @@ def test_build_runs_syncs_and_their_tests(project: Path, patched_runtime: dict[s
     assert by_name["a_with_tests"]["tests"][0]["passed"] is True
     assert by_name["b_plain"]["tests"] == []  # no tests: defined — stable empty shape
     assert payload["succeeded"] == 2
+
+
+def test_build_json_entries_share_a_real_invocation_run_id(
+    project: Path, patched_runtime: dict[str, Any]
+) -> None:
+    import uuid
+
+    result = runner.invoke(app, ["build", "--output", "json"])
+
+    assert result.exit_code == 0, result.output
+    run_ids = {entry["run_id"] for entry in json.loads(result.output)["syncs"]}
+    assert len(run_ids) == 1
+    uuid.UUID(run_ids.pop())
 
 
 def test_build_failing_test_marks_sync_failed(
