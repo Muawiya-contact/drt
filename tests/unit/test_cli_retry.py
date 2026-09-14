@@ -763,11 +763,6 @@ def test_retry_persists_ledger_and_audit_for_earlier_chunk_before_a_later_chunk_
     """#1127/#1128: a later chunk's dest.load() raising (the documented,
     uncaught Destination.load() contract) must not lose an earlier chunk's
     already-confirmed delivery from the idempotency ledger / audit trail.
-    DLQ removal itself is deliberately NOT persisted per chunk (a per-chunk
-    reconcile() would make retry cost quadratic — caught in Codex review on
-    #1128 — since DlqBackend has no cheaper mutation-only primitive), so
-    both entries stay queued after the raise. The ledger mark is still the
-    load-bearing half: it's what stops the next retry from resending id=1.
     batch_size: 1 forces id=1 and id=2 into separate chunks; the fake
     destination succeeds on the first load() call and raises on the
     second."""
@@ -803,25 +798,163 @@ def test_retry_persists_ledger_and_audit_for_earlier_chunk_before_a_later_chunk_
     assert sorted(sum(ledger.marked, [])) == ["1"]
     logged_keys = {e.record_key for _, _, _, _, entries in audit_trail.logged for e in entries}
     assert logged_keys == {"1"}
-    # ... but DLQ removal is deferred to one reconcile() call at the very
-    # end, which this raise never reached — both entries are still queued.
-    assert [e.record["id"] for e in store.read("post_users")] == [1, 2]
+    # ... and the fix for the other half of #1127 means the exception
+    # handler also reconciles what was accumulated so far before re-raising,
+    # so id=1 is already removed from the DLQ too — only id=2 (never
+    # attempted) is still queued.
+    assert [e.record["id"] for e in store.read("post_users")] == [2]
 
-    # The fix is load-bearing: prove it by retrying again against a fresh
-    # destination that would happily resend id=1. The ledger mark from the
-    # first (crashed) attempt must make this retry skip id=1 as a duplicate
-    # and only actually send id=2.
+    # A subsequent retry against a fresh destination only re-sends the
+    # genuinely-untouched id=2 — id=1 is gone, not a duplicate to skip.
     second_dest = _FakeDestination(fail_ids=set())
     _patch_dest(monkeypatch, second_dest)
     summary = replay_dead_letters(sync, project_dir=ledger_audit_project)
 
-    assert summary["skipped_duplicate"] == 1
+    assert summary["skipped_duplicate"] == 0
     assert summary["succeeded"] == 1
     assert [rec["id"] for call in second_dest.calls for rec in call] == [2]
-    # id=1 is a duplicate hit, not a failure — it stays queued for an
-    # operator to inspect (see the ledger-hit contract above), while id=2
-    # is gone.
-    assert [e.record["id"] for e in store.read("post_users")] == [1]
+    assert store.read("post_users") == []
+
+
+def test_retry_persists_dlq_removal_for_earlier_chunk_before_a_later_chunk_raises_without_ledger(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1127, remaining half, without a ledger backstop: the default project
+    fixture has no ``state.idempotency`` enabled, so nothing but the DLQ
+    itself protects against resending an already-delivered record. Before
+    this fix, a later chunk's dest.load() raising skipped the single
+    end-of-function reconcile() entirely, leaving id=1 (already delivered by
+    the first, successful load() call) still queued for a plain resend on
+    the next retry. The fix reconciles whatever was accumulated so far
+    inside the exception handler before re-raising, so id=1 must already be
+    gone from the DLQ here — while id=2 (never attempted, since it's the
+    chunk whose load() raised) stays queued with its ``attempts`` count
+    unchanged, proving it was never touched rather than attempted-and-failed."""
+    from drt.cli.commands.retry import replay_dead_letters
+    from drt.config.parser import load_syncs
+
+    (project / "syncs" / "post_users.yml").write_text(
+        yaml.dump(
+            {
+                "name": "post_users",
+                "model": "ref('users')",
+                "destination": {"type": "rest_api", "url": "https://example.com"},
+                "sync": {"batch_size": 1, "dlq": {"enabled": True}},
+            }
+        )
+    )
+    store = _seed(project, [1, 2])
+    _patch_dest(monkeypatch, _FakeRaisingDestination(succeed_calls=1))
+    sync = next(s for s in load_syncs(project) if s.name == "post_users")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        replay_dead_letters(sync, project_dir=project)
+
+    remaining = store.read("post_users")
+    assert [e.record["id"] for e in remaining] == [2]
+    assert remaining[0].attempts == 1  # unchanged default — never attempted
+
+
+def test_retry_exception_path_does_not_delete_an_untouched_legacy_duplicate(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review round 2 on #1146: the exception-path reconcile() must not
+    delete an untouched legacy dead letter just because a *different*
+    physical entry sharing its content-derived id was confirmed by an
+    earlier chunk. Two byte-identical pre-#955 legacy lines (no ``id`` key)
+    decode to the same SHA-256 fallback id (``decode_dead_letter_line()``).
+    batch_size: 1 puts them in separate chunks; the fake destination
+    succeeds on the first load() call (confirming the first physical entry)
+    and raises on the second (the second physical entry's own chunk — it is
+    never actually attempted). Before the guard, naming that shared id in
+    the exception-path reconcile()'s remove_ids would delete both physical
+    entries, silently discarding the untouched second one."""
+    from drt.cli.commands.retry import replay_dead_letters
+    from drt.config.parser import load_syncs
+    from drt.state.dlq import decode_dead_letter_line
+
+    (project / "syncs" / "post_users.yml").write_text(
+        yaml.dump(
+            {
+                "name": "post_users",
+                "model": "ref('users')",
+                "destination": {"type": "rest_api", "url": "https://example.com"},
+                "sync": {"batch_size": 1, "dlq": {"enabled": True}},
+            }
+        )
+    )
+    raw_line = '{"record": {"n": 1}, "error_message": "boom"}'
+    # Precondition: confirm these two byte-identical legacy lines really do
+    # collide on id before relying on that to make the rest of the test
+    # meaningful (otherwise this would pass vacuously).
+    assert decode_dead_letter_line(raw_line).id == decode_dead_letter_line(raw_line).id
+
+    dlq_path = project / ".drt" / "dlq" / "post_users.jsonl"
+    dlq_path.parent.mkdir(parents=True, exist_ok=True)
+    dlq_path.write_text(raw_line + "\n" + raw_line + "\n")
+
+    store = DlqStore(project)
+    _patch_dest(monkeypatch, _FakeRaisingDestination(succeed_calls=1))
+    sync = next(s for s in load_syncs(project) if s.name == "post_users")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        replay_dead_letters(sync, project_dir=project)
+
+    # Both physical entries survive: the confirmed one wasn't safe to remove
+    # without also removing its untouched, never-attempted twin.
+    assert len(store.read("post_users")) == 2
+
+
+def test_retry_exception_path_does_not_delete_an_untouched_legacy_duplicate_beyond_limit(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review round 3 on #1146: the first version of the exception-path
+    guard only excluded ``to_retry``'s own unprocessed suffix from
+    ``remove_ids`` — it missed a legacy duplicate excluded from ``to_retry``
+    entirely by ``--limit`` (``untouched``). Queue: [A, B, A2], where A and
+    A2 are byte-identical legacy lines (same content-derived id) and B is
+    distinct. ``--limit 2`` + ``batch_size: 1`` means ``to_retry = [A, B]``
+    and ``untouched = [A2]``; the fake destination succeeds on A (confirming
+    it) and raises on B. Before this round's fix, A's id would still land in
+    the exception-path reconcile()'s remove_ids (nothing in `to_retry`'s
+    unprocessed suffix — just B — shares A's id), silently deleting A2 too
+    even though `--limit` was never meant to touch it."""
+    from drt.cli.commands.retry import replay_dead_letters
+    from drt.config.parser import load_syncs
+    from drt.state.dlq import decode_dead_letter_line
+
+    (project / "syncs" / "post_users.yml").write_text(
+        yaml.dump(
+            {
+                "name": "post_users",
+                "model": "ref('users')",
+                "destination": {"type": "rest_api", "url": "https://example.com"},
+                "sync": {"batch_size": 1, "dlq": {"enabled": True}},
+            }
+        )
+    )
+    line_a = '{"record": {"n": 1}, "error_message": "boom"}'
+    line_b = '{"record": {"n": 2}, "error_message": "boom"}'
+    # Preconditions: A/A2 collide on id, and B's id genuinely differs from
+    # A's — otherwise this test wouldn't isolate what it claims to.
+    assert decode_dead_letter_line(line_a).id == decode_dead_letter_line(line_a).id
+    assert decode_dead_letter_line(line_a).id != decode_dead_letter_line(line_b).id
+
+    dlq_path = project / ".drt" / "dlq" / "post_users.jsonl"
+    dlq_path.parent.mkdir(parents=True, exist_ok=True)
+    dlq_path.write_text(line_a + "\n" + line_b + "\n" + line_a + "\n")
+
+    store = DlqStore(project)
+    _patch_dest(monkeypatch, _FakeRaisingDestination(succeed_calls=1))
+    sync = next(s for s in load_syncs(project) if s.name == "post_users")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        replay_dead_letters(sync, project_dir=project, limit=2)
+
+    # All three physical entries survive: A's confirmed delivery isn't safe
+    # to reconcile while A2 -- excluded from this retry entirely by --limit
+    # -- still shares its id.
+    assert len(store.read("post_users")) == 3
 
 
 def test_retry_excludes_unattributed_skip_from_ledger_and_audit(
