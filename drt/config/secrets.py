@@ -23,6 +23,7 @@ _KNOWN_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 _MIN_ENTROPY_SECRET_LENGTH = 20
 _SHANNON_ENTROPY_THRESHOLD = 3.5
+_TEMPLATE_EXPR_RE = re.compile(r"\$\{[^}]*\}|\{\{[^}]*\}\}")
 
 
 @dataclass(frozen=True)
@@ -118,18 +119,34 @@ def _is_secret_field(field_name: str) -> bool:
 
 
 def _secret_reason(value: str) -> str | None:
-    if "${" in value:
-        return None
     stripped = value.strip()
     if not stripped:
         return None
 
+    # Known-pattern matching runs before the template exemption below: a
+    # literal secret (e.g. `sk_live_...`) hardcoded alongside a `${VAR}` or
+    # `{{ jinja }}` reference must still be caught, precise regex matches
+    # have effectively no false-positive rate regardless of what else is in
+    # the string (#897, Codex review of PR #1150).
     for name, pattern in _KNOWN_SECRET_PATTERNS:
         if pattern.search(stripped):
             return name
 
-    if _looks_high_entropy(stripped):
-        return f"high entropy ({_shannon_entropy(stripped):.2f})"
+    # Strip env-var/Jinja template expressions before the entropy fallback:
+    # a rendered `${VAR}` or `{{ row.customer_uuid }}` reads as dense text
+    # that _looks_high_entropy() below can't distinguish from a real
+    # secret. Stripping (rather than a blanket bypass) means a *literal*
+    # high-entropy secret placed alongside a template -- e.g. a generic API
+    # token with no known-provider pattern, followed by `{{ var('suffix')
+    # }}` -- still gets scanned on what's left over (#897, Codex review of
+    # PR #1150, round 4: an earlier blanket bypass here missed exactly this
+    # case for any secret not matching one of the patterns above).
+    literal = _TEMPLATE_EXPR_RE.sub("", stripped).strip()
+    if not literal:
+        return None
+
+    if _looks_high_entropy(literal):
+        return f"high entropy ({_shannon_entropy(literal):.2f})"
 
     return None
 

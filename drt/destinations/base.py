@@ -340,3 +340,40 @@ class QueryableDestination(Protocol):
             Exception: connection or query failure.
         """
         ...
+
+
+@runtime_checkable
+class NativeIdempotencyCapable(Protocol):
+    """Destination that wires ``destination.native_idempotency_key`` into its
+    own ``load()`` for retry-safety against drt's per-destination retry (#277,
+    #897).
+
+    Stability: Public, **not yet frozen** (see ADR 0007's freeze-scope
+    table — same status as ``ManagedTableCapable`` when it shipped: no
+    destination implements this yet, so its method set hasn't been
+    exercised against a real caller. The config field ships on every
+    SaaS/SMTP/ads destination before any wiring lands, so ``drt validate``
+    can warn when it's set on a type that still ignores it; see
+    ``drt/cli/commands/validate.py``'s ``_find_ineffective_native_idempotency_keys``).
+
+    Support is an opt-in capability the CLI checks structurally —
+    ``isinstance(dest, NativeIdempotencyCapable)`` — rather than a
+    hardcoded core-only type allowlist, so a plugin destination (registered
+    via the #297 entry-point system) can wire this field into its own
+    ``load()`` and correctly stop triggering the no-op warning without any
+    change to drt-core, per AGENTS.md's registry-driven connector extension
+    rule.
+    """
+
+    def supports_native_idempotency_key(self, config: DestinationConfig) -> bool:
+        """Return whether ``native_idempotency_key`` is actually wired for
+        *this* destination config.
+
+        Takes the config (not just ``self``) so a destination whose wiring
+        is conditional on a config value (e.g. ``rest_api``'s ``record``
+        vs. ``body_mode: batch`` -- a per-record template is inapplicable
+        in batch mode, see ``rest_api.py``) can answer precisely for the
+        specific sync being validated, rather than being all-or-nothing at
+        the type level.
+        """
+        ...
