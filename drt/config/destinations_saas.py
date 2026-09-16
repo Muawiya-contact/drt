@@ -793,6 +793,35 @@ class GoogleAdsDestinationConfig(BaseModel):
         ``customer_id`` is the narrower scope and would over-split it.
         ``describe_safe()`` drops the id entirely (#696), another reason it
         cannot be the key. (``BaseModel``-direct config.)
+
+        Deliberately **not** refined by OAuth client identity, even though
+        ``developer_token_env`` alone over-shares one bucket across
+        genuinely distinct tokenless Cloud projects that all leave this
+        field at its shared default name (#1154, Google's Cloud-project-
+        based access model made the developer-token header optional).
+        Two narrower keys were tried and rejected across three Codex review
+        rounds on #1155:
+
+        - Appending ``_auth_identity(self.auth)`` unconditionally splits two
+          OAuth clients that share one real token's quota -- when a token
+          *is* configured, Google enforces it per token regardless of which
+          client authenticates, so those clients must share one bucket.
+        - Overriding the key by OAuth-client identity only for the
+          tokenless case (via ``GoogleAdsDestination.load()``'s
+          ``resolve_rate_limiter(..., key_override=...)``) still under-shares:
+          Google's Cloud-project-based access model scopes quota to the
+          project that owns the OAuth client's credentials, and one project
+          can own several OAuth clients, so per-client keys can still split
+          one real, shared quota across independent limiters.
+
+        No field on ``OAuth2ClientCredentialsAuth`` currently identifies the
+        underlying Cloud project, so there is no signal left to split on
+        that isn't itself known to be wrong. Per this codebase's own
+        over-sharing-is-safe / under-sharing-can-429 policy (see the
+        process-wide rate-limiter registry note in AGENTS.md), every
+        ``google_ads`` config -- tokenless or not -- shares one bucket here
+        until a config field can name the real Cloud-project identity
+        (tracked as #1157).
         """
         return f"{self.type}:{self.developer_token_env}"
 
