@@ -38,6 +38,33 @@ def test_serve_auth_hmac_requires_secret(monkeypatch: pytest.MonkeyPatch) -> Non
     assert "DRT_WEBHOOK_HMAC_SECRET" in result.output
 
 
+def test_serve_auth_oidc_requires_audience() -> None:
+    # Not asserting on result.output content here (unlike the bearer/hmac
+    # checks above): Typer/Click/Rich's error-panel rendering wraps and can
+    # truncate long option names depending on the detected terminal width,
+    # which differs enough between environments (observed: passes locally,
+    # fails on GitHub Actions' Linux runners) to make substring assertions
+    # against the rendered panel unreliable. The actual validation message is
+    # already pinned, reliably, by test_serve_oidc_scheme_requires_audience
+    # below (which calls serve() directly, bypassing CLI rendering
+    # entirely) -- this test's job is just confirming the CLI layer surfaces
+    # the failure as a non-zero exit.
+    result = runner.invoke(app, ["serve", "--auth", "oidc"])
+    assert result.exit_code != 0
+
+
+def test_serve_auth_oidc_requires_email() -> None:
+    """A valid signature and audience alone are not proof of authorization
+    (Codex review on #903) -- --oidc-email is required, not optional.
+
+    See test_serve_auth_oidc_requires_audience's comment on why this
+    doesn't assert on result.output content."""
+    result = runner.invoke(
+        app, ["serve", "--auth", "oidc", "--oidc-audience", "https://drt.example.com/sync/s"]
+    )
+    assert result.exit_code != 0
+
+
 def test_serve_passes_options_through(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DRT_WEBHOOK_TOKEN", "tok123")
     with mock.patch("drt.cli.server.serve") as serve_impl:
@@ -53,7 +80,30 @@ def test_serve_passes_options_through(monkeypatch: pytest.MonkeyPatch) -> None:
         hmac_header="X-Hub-Signature-256",
         hmac_scheme="generic",
         hmac_tolerance=300,
+        oidc_audience=None,
+        oidc_email=None,
     )
+
+
+def test_serve_passes_oidc_options_through() -> None:
+    with mock.patch("drt.cli.server.serve") as serve_impl:
+        result = runner.invoke(
+            app,
+            [
+                "serve",
+                "--auth",
+                "oidc",
+                "--oidc-audience",
+                "https://drt.example.com/sync/s",
+                "--oidc-email",
+                "svc@example.com",
+            ],
+        )
+    assert result.exit_code == 0
+    kwargs = serve_impl.call_args.kwargs
+    assert kwargs["auth_scheme"] == "oidc"
+    assert kwargs["oidc_audience"] == "https://drt.example.com/sync/s"
+    assert kwargs["oidc_email"] == "svc@example.com"
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +158,33 @@ def test_serve_hmac_scheme_builds(fake_http_server: type[_FakeHTTPServer], tmp_p
 
 def test_serve_rejects_bad_scheme(tmp_path: Any) -> None:
     with pytest.raises(ValueError, match="unknown auth scheme"):
+        serve(port=0, project_dir=str(tmp_path), auth_scheme="saml")
+
+
+def test_serve_oidc_scheme_requires_audience(tmp_path: Any) -> None:
+    with pytest.raises(ValueError, match="requires an audience"):
         serve(port=0, project_dir=str(tmp_path), auth_scheme="oidc")
+
+
+def test_serve_oidc_scheme_requires_email(tmp_path: Any) -> None:
+    with pytest.raises(ValueError, match="requires an expected caller email"):
+        serve(
+            port=0,
+            project_dir=str(tmp_path),
+            auth_scheme="oidc",
+            oidc_audience="https://drt.example.com/sync/s",
+        )
+
+
+def test_serve_oidc_scheme_builds(fake_http_server: type[_FakeHTTPServer], tmp_path: Any) -> None:
+    serve(
+        port=0,
+        project_dir=str(tmp_path),
+        auth_scheme="oidc",
+        oidc_audience="https://drt.example.com/sync/s",
+        oidc_email="svc@example.com",
+    )
+    assert fake_http_server.instances[0].shutdown_called
 
 
 def test_serve_wires_a_real_project(fake_http_server: type[_FakeHTTPServer], tmp_path: Any) -> None:

@@ -8,7 +8,7 @@ import typer
 
 from drt.cli._app import app
 
-_AUTH_SCHEMES = ("auto", "none", "bearer", "hmac")
+_AUTH_SCHEMES = ("auto", "none", "bearer", "hmac", "oidc")
 _HMAC_SCHEMES = ("generic", "stripe")
 
 # Each sender names the header differently, so the default follows the scheme
@@ -31,7 +31,8 @@ def serve(
         "--auth",
         help=(
             "Auth scheme: auto (bearer if token env set, else none), "
-            "none, bearer, or hmac (HMAC-SHA256 body signature)."
+            "none, bearer, hmac (HMAC-SHA256 body signature), or oidc "
+            "(Google-signed OIDC JWT — Pub/Sub push's own scheme)."
         ),
     ),
     hmac_secret_env: str = typer.Option(
@@ -64,6 +65,25 @@ def serve(
             "Stripe's own libraries default to 300."
         ),
     ),
+    oidc_audience: str = typer.Option(
+        "",
+        "--oidc-audience",
+        help=(
+            "Required for --auth oidc: the URL Pub/Sub's push subscription "
+            "was configured with (the aud claim Google's JWT must carry)."
+        ),
+    ),
+    oidc_email: str = typer.Option(
+        "",
+        "--oidc-email",
+        help=(
+            "Required for --auth oidc: the one service account's email "
+            "allowed to call this endpoint (e.g. the Pub/Sub subscription's "
+            "own push service account). A valid signature and audience "
+            "alone do not prove authorization -- Google will mint a token "
+            "with any audience for any Google Cloud principal."
+        ),
+    ),
 ) -> None:
     """Start an HTTP endpoint that triggers drt syncs on demand.
 
@@ -93,6 +113,10 @@ def serve(
         raise typer.BadParameter(
             f"--auth hmac requires a secret in ${hmac_secret_env}", param_hint="--auth"
         )
+    if auth == "oidc" and not oidc_audience:
+        raise typer.BadParameter("--auth oidc requires --oidc-audience", param_hint="--auth")
+    if auth == "oidc" and not oidc_email:
+        raise typer.BadParameter("--auth oidc requires --oidc-email", param_hint="--auth")
     if hmac_scheme not in _HMAC_SCHEMES:
         raise typer.BadParameter(
             f"--hmac-scheme must be one of {', '.join(_HMAC_SCHEMES)}",
@@ -115,4 +139,6 @@ def serve(
         hmac_header=hmac_header or _DEFAULT_HMAC_HEADER[hmac_scheme],
         hmac_scheme=hmac_scheme,
         hmac_tolerance=hmac_tolerance,
+        oidc_audience=oidc_audience or None,
+        oidc_email=oidc_email or None,
     )
