@@ -451,7 +451,12 @@ def print_diff_table(diff: object, sync_name: str) -> None:
 
 
 def diff_to_dict(diff: object) -> dict[str, object]:
-    """Serialise a DiffResult for ``--output json`` mode."""
+    """Serialise a DiffResult for ``--output json`` mode (and, via
+    ``run.py``'s ``entry["diff"]``, the persisted run_results.json
+    artifact, #778 -- which drops ``delete_preview_unavailable_reason``
+    before writing, since unlike ``fallback_reason`` it can only ever be
+    raw connector-exception text; see ``run.py``'s
+    ``_sanitize_entry_for_artifact``)."""
     from drt.engine.diff import DiffResult
 
     assert isinstance(diff, DiffResult)

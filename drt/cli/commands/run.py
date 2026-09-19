@@ -9,6 +9,7 @@ Extracted from ``drt/cli/main.py`` in Phase 2b PR (a) of the #546 split
   telemetry)
 - ``_print_watermark_summary`` (post-run notes about default / override
   watermark usage)
+- ``_write_run_results`` (``target/drt/run_results.json`` per invocation, #778)
 - ``run`` (the @app.command itself; signal handling; parallel/sequential
   dispatch; JSON-mode output)
 
@@ -31,6 +32,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -40,6 +42,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import typer
+
+from drt import __version__
 
 if TYPE_CHECKING:
     from drt.config.base import QueryTaggingConfig
@@ -55,6 +59,7 @@ if TYPE_CHECKING:
 
 
 from drt._identifiers import new_run_id
+from drt._redaction import REDACTED, redact_error_text
 from drt.cli._app import app
 from drt.cli._helpers import (
     exit_code_for_signal as _exit_code_for_signal,
@@ -190,27 +195,35 @@ def _run_one(
     from drt.engine.sync import run_sync
     from drt.security import PermissionAction, get_permission_checker
 
-    # Enterprise extension point (#298, ADR 0008) — no-op under the OSS
-    # default (AllowAllPermissionChecker); raises PermissionDeniedError if
-    # an Enterprise checker is registered and denies this sync.
-    get_permission_checker().check(PermissionAction.RUN, sync.name)
-
-    dest = get_destination(sync)
-    wm_storage = get_watermark_storage(sync, Path("."))
-    observer = _build_observer(sync, ctx, wm_storage)
-    if not ctx.json_mode and not ctx.dry_run and not ctx.quiet:
-        print_sync_start(sync.name, ctx.dry_run)
     t0 = time.monotonic()
     started_at = datetime.now(timezone.utc).isoformat()  # for #784 degraded-alert context
-    if ctx.log_json:
-        logging.info("sync_started", extra={"sync": sync.name})
-
     status_str = "failed"
     rows_synced = 0
     elapsed = 0.0
     return_value: tuple[str, dict[str, object], bool]
     try:
         try:
+            # Enterprise extension point (#298, ADR 0008) — no-op under the OSS
+            # default (AllowAllPermissionChecker); raises PermissionDeniedError if
+            # an Enterprise checker is registered and denies this sync.
+            get_permission_checker().check(PermissionAction.RUN, sync.name)
+
+            # Setup (destination/watermark-storage/observer construction) is
+            # inside this try too (#778 review) -- previously a failure here
+            # (e.g. a destination's __init__ validating a config value)
+            # propagated out of _run_one entirely uncaught, skipping this
+            # sync's entry rather than recording it as a structured failure.
+            # None of these three are referenced below by the failure branch,
+            # only by the success path, so widening the try changes nothing
+            # about what a run_sync() failure itself reports.
+            dest = get_destination(sync)
+            wm_storage = get_watermark_storage(sync, Path("."))
+            observer = _build_observer(sync, ctx, wm_storage)
+            if not ctx.json_mode and not ctx.dry_run and not ctx.quiet:
+                print_sync_start(sync.name, ctx.dry_run)
+            if ctx.log_json:
+                logging.info("sync_started", extra={"sync": sync.name})
+
             result = run_sync(
                 sync,
                 ctx.source,
@@ -253,6 +266,13 @@ def _run_one(
                 # Preserve `error` for backwards compatibility with JSON
                 # consumers that already parse it. Add structured siblings
                 # for new consumers (stage, error_type, error_suggestion).
+                # Raw and unredacted, same as before #778 -- a heuristic
+                # keyword sweep has no fixed point against arbitrary
+                # connector-exception text (#778 review, several rounds).
+                # `_sanitize_entry_for_artifact` drops this key entirely
+                # before it reaches the persisted run_results.json instead;
+                # it stays here, unredacted, for --output json stdout and
+                # the console render, same as always.
                 "error": str(e),
                 "error_type": fe.error_type,
                 "error_stage": fe.stage.value,
@@ -332,11 +352,16 @@ def _run_one(
             print_row_errors(result.row_errors)
         diff_value = getattr(result, "diff", None)
         if diff_value is not None:
-            if ctx.json_mode:
-                from drt.cli.output import diff_to_dict
+            # Populated unconditionally (#778) -- this feeds both the
+            # --output json stdout and the run_results.json artifact, which
+            # is documented as independent of --output; gating it on
+            # ctx.json_mode silently dropped diff data from the artifact for
+            # a plain-text `--dry-run --diff` run. Console rendering stays a
+            # separate, text-mode-only concern below.
+            from drt.cli.output import diff_to_dict
 
-                entry["diff"] = diff_to_dict(diff_value)
-            elif not ctx.quiet:
+            entry["diff"] = diff_to_dict(diff_value)
+            if not ctx.json_mode and not ctx.quiet:
                 from drt.cli.output import print_diff_table
 
                 print_diff_table(diff_value, sync.name)
@@ -423,6 +448,189 @@ def _print_watermark_summary(results: list[dict[str, object]]) -> None:
             f"\n[cyan]Note: {len(lag_syncs)} sync(s) widened the read window via "
             f"watermark.lag (overlap rows re-sent): {names}[/cyan]"
         )
+
+
+def _redact_argv(argv: list[str]) -> list[str]:
+    """Redact ``argv`` for persistence into ``run_results.json`` (#778).
+
+    ``--vars`` carries arbitrary, project-defined variable names -- unlike
+    ``entry["error"]``'s free-form connector exceptions, there is no fixed
+    keyword list (``password``, ``token``, ...) that could ever cover every
+    project's own var names (a ``stripe_key: sk_live_...`` var wouldn't
+    match any of them), so a heuristic sweep under-redacts here. Every value
+    directly following ``--vars`` (both ``--vars value`` and ``--vars=value``
+    forms) is therefore treated as wholly sensitive and redacted outright,
+    same trust model as `docs/guides/using-with-dbt.md`'s "project config,
+    surface injection-shaped ones rather than blocking" already applies to
+    vars elsewhere. Every other argument still goes through the free-text
+    sweep (a connector URL/DSN could appear in, say, a ``--state`` path).
+    """
+    redacted = []
+    take_next_whole = False
+    for arg in argv:
+        if take_next_whole:
+            redacted.append(REDACTED)
+            take_next_whole = False
+        elif arg == "--vars":
+            redacted.append(arg)
+            take_next_whole = True
+        elif arg.startswith("--vars="):
+            redacted.append(f"--vars={REDACTED}")
+        else:
+            redacted.append(redact_error_text(arg))
+    return redacted
+
+
+_DIFF_REASON_REDACTED = (
+    "redacted for run_results.json -- see console output or --output json for detail"
+)
+
+
+def _sanitize_entry_for_artifact(entry: dict[str, object]) -> dict[str, object]:
+    """Drop or replace the free-text fields a per-sync entry can carry
+    before it reaches the persisted run_results.json (#778 review).
+
+    A #778 review round found no fixed point for redacting arbitrary
+    connector-exception text by pattern (see ``drt/_redaction.py``'s
+    docstring) -- so this doesn't try. Instead, the two fields that are
+    *only* ever raw exception text are kept out of the file entirely:
+
+    - ``error`` (``str(exception)`` from a sync failure) is dropped outright.
+      ``error_type``/``error_stage``/``error_suggestion`` are bounded
+      vocabulary (an exception class name, an enum value, a static
+      rule-table string) and stay -- a CI consumer still gets stage +
+      exception class, which is what triage needs. The full text is still
+      in the job log (console render) and in ``--output json`` stdout for
+      existing consumers, unredacted, same as always -- this only stops
+      duplicating it into a file this project documents uploading to CI
+      artifact storage.
+    - ``diff.delete_preview_unavailable_reason`` (a failed mirror-delete
+      preview read) is replaced with a fixed placeholder rather than
+      dropped or set to null -- unlike ``error``, null already means
+      something specific here (the delete read succeeded), and the two
+      must not collapse into each other (see ``DiffResult``'s own
+      docstring). ``diff.fallback_reason`` needs no such handling: its one
+      exception-derived case is sanitized at the source
+      (``drt/engine/diff.py``) since, unlike ``delete_preview_unavailable_
+      reason``, existing tests pin its exact text for the other three
+      (static, benign) cases and dropping it wholesale would cost real,
+      always-safe diagnostic value for the common non-queryable-destination
+      path.
+    """
+    sanitized = {k: v for k, v in entry.items() if k != "error"}
+    diff_value = sanitized.get("diff")
+    if isinstance(diff_value, dict) and diff_value.get("delete_preview_unavailable_reason"):
+        sanitized["diff"] = {
+            **diff_value,
+            "delete_preview_unavailable_reason": _DIFF_REASON_REDACTED,
+        }
+    return sanitized
+
+
+def _write_run_results(
+    target_path: Path,
+    *,
+    run_id: str,
+    started_at: str,
+    results: list[dict[str, object]],
+    succeeded: int,
+    failed: int,
+    skipped: int,
+    total_duration: float,
+    exit_code: int,
+) -> None:
+    """Write ``<target_path>/run_results.json`` (#778) — a durable,
+    machine-readable per-invocation record, dbt's ``run_results.json``
+    pattern, for CI/observability consumption that stdout doesn't serve
+    (a CI system can't upload a run artifact from console output).
+
+    Written independent of ``--output`` (text vs json) -- the point is a
+    durable record *even when* JSON wasn't requested on stdout -- reusing
+    the exact same ``results`` entries ``--output json`` already builds
+    (``run.py``'s ``_run_one``/``_skipped_entry``, including ``diff`` --
+    populated unconditionally there, not gated on json_mode), so there is
+    no second, divergent shape to keep in sync.
+
+    ``schema_version`` follows the docs manifest's own convention
+    (``drt/docs/manifest.py``'s ``SCHEMA_VERSION``) rather than publishing a
+    separate JSON Schema file -- this repo has no precedent for the latter
+    even for the docs manifest, a comparably important artifact, and a
+    second, different versioning story for one more artifact type would be
+    its own inconsistency. New fields are additive/omit-when-absent, same
+    discipline as the manifest.
+
+    ``exit_code`` disambiguates a legitimate zero-result no-op (nothing
+    selected/changed/failed to retry -- ``succeeded``/``failed``/``skipped``
+    genuinely all 0, ``exit_code`` 0) from a *rejected* invocation (a bad
+    ``--limit``/``--full-refresh``/``--cursor-value`` combination, an
+    unmatched selector) that never got far enough to attempt a sync either,
+    but is not healthy -- without it the two are byte-identical on the
+    ``results``/counts alone (#778 review).
+
+    Best-effort: a write failure (permissions, a read-only filesystem, disk
+    full) is logged and swallowed rather than raised -- this bookkeeping
+    must never change the run's own exit code or mask a real sync failure.
+    Serialization uses ``default=str`` -- a diff sample (#778 review) can
+    carry warehouse-native ``datetime``/``Decimal``/UUID values ``json``
+    can't handle natively, and a serialization failure on an otherwise
+    successful preview must degrade to a readable string, not crash the
+    command's own bookkeeping. Called from a ``finally`` block wrapping the
+    whole "syncs are known" portion of ``run()`` -- so it fires on the no-op
+    exits too, not just after a full dispatch loop, and still fires on a
+    graceful-shutdown (#279) exit or an unhandled exception. It does *not*
+    fire on preflight failures before ``syncs`` is resolved (bad
+    project/profile/vars) -- mirrors dbt's own run_results.json, which isn't
+    written until compilation resolves a node list.
+
+    Not included in this version, deliberately: a per-sync watermark
+    before/after pair. The engine never returns the post-run watermark
+    value to the CLI today (only to ``StatePersistingObserver``, which
+    persists it directly) -- adding it would mean an extra
+    ``watermark_storage.get()`` read per sync purely for this artifact,
+    which isn't justified until a real consumer asks for it.
+    """
+    # Redacted (#778 review): this is the one place argv is persisted to
+    # disk rather than transient console/log output.
+    argv = _redact_argv(sys.argv)
+    run_results = {
+        "schema_version": 1,
+        "invocation": {
+            "run_id": run_id,
+            "started_at": started_at,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "duration_seconds": total_duration,
+            "argv": argv,
+            "drt_version": __version__,
+            "exit_code": exit_code,
+            "succeeded": succeeded,
+            "failed": failed,
+            "skipped": skipped,
+        },
+        "results": results,
+    }
+    final_path = target_path / "run_results.json"
+    # Suffixed with run_id (#778 review) -- a fixed temp name would collide
+    # if two `drt run` invocations ever share a target_path concurrently,
+    # letting one process's rename land mid-write of the other's and
+    # defeating the atomic-write guarantee below.
+    tmp_path = target_path / f".run_results.json.{run_id}.tmp"
+    try:
+        target_path.mkdir(parents=True, exist_ok=True)
+        # Write-then-rename: a disk-full or interrupted write hitting
+        # `write_text()` on the final path directly could leave a
+        # truncated, invalid JSON file behind for the documented
+        # `if: always()` CI step to upload -- worse than no file at all.
+        # `Path.replace()` is an atomic same-filesystem rename (os.replace),
+        # so the final path only ever holds a complete write or its
+        # previous (possibly absent) content.
+        tmp_path.write_text(json.dumps(run_results, indent=2, default=str))
+        tmp_path.replace(final_path)
+    except OSError as e:
+        logging.getLogger(__name__).warning("Failed to write run_results.json: %s", e)
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +800,20 @@ def run(
         "--diff-limit",
         help="Maximum number of records to show per diff category (default 20).",
     ),
+    target_path: Path = typer.Option(
+        Path("target/drt"),
+        "--target-path",
+        help=(
+            "Directory to write run_results.json into (#778). Defaults to "
+            "target/drt, not dbt's own target/, so a co-located `dbt run && "
+            "drt run` (docs/guides/using-with-dbt.md) doesn't clobber dbt's "
+            "own target/run_results.json. Written independent of --output "
+            "for every invocation that resolves a sync list, including "
+            "no-op runs (nothing selected/changed/failed) -- not written "
+            "for preflight failures (bad project/profile/vars) before "
+            "syncs are known."
+        ),
+    ),
 ) -> None:
     """Run sync(s) defined in the project.
 
@@ -611,6 +833,18 @@ def run(
       drt run --failed
       drt run --dry-run --diff
     """
+    # #778 review: clear any prior invocation's artifact up front. A
+    # preflight failure (this check, a missing project/profile, malformed
+    # --vars) never reaches the try/finally below that writes a fresh one
+    # (by design -- syncs aren't known yet, see _write_run_results), so a
+    # stale successful artifact from a previous run in a reused workspace
+    # would otherwise sit there to be silently re-uploaded by a CI job's
+    # `if: always()` step as if it were this (failed) invocation's result.
+    try:
+        (target_path / "run_results.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
     if diff and not dry_run:
         print_error("--diff requires --dry-run")
         raise typer.Exit(1)
@@ -665,301 +899,343 @@ def run(
     except VarError as e:
         print_error(str(e))
         raise typer.Exit(1)
-    if not syncs:
-        if not json_mode:
-            console.print("[dim]No syncs found in syncs/. Add .yml files to get started.[/dim]")
-        raise typer.Exit()
 
-    try:
-        if state is not None:
-            from drt.cli._state_selection import load_state_diff
-
-            state_diff = load_state_diff(state, syncs, Path("."))
-            syncs = select_syncs(syncs, select, exclude, state_diff=state_diff)
-        else:
-            syncs = select_syncs(syncs, select, exclude)
-    except SelectionError as e:
-        print_error(str(e))
-        raise typer.Exit(1)
-    if not syncs:
-        if is_state_only_select(select):
-            # Nothing changed relative to the baseline — the normal, healthy
-            # outcome for a CI job on a PR that touched no sync definitions,
-            # not an error the way a dud tag:/bare-name selector would be.
-            if not json_mode:
-                console.print(
-                    "[dim]No syncs changed relative to the baseline — nothing to run.[/dim]"
-                )
-            raise typer.Exit()
-        print_error("Selection matched no syncs (after --exclude).")
-        raise typer.Exit(1)
-
-    # --failed (#773): sync-level re-run of the previous invocation's
-    # failures. Applied after --select/--exclude (intersection semantics).
-    # A clean previous state exits 0 — recovery loops shouldn't page when
-    # there is nothing to recover. (Record-level replay is `drt retry`.)
-    if failed_only:
-
-        def _last_run_failed(sync_cfg: SyncConfig) -> bool:
-            prev = state_bundle.state.get_last_sync(sync_cfg.name)
-            return prev is not None and prev.status != "success"
-
-        syncs = [s for s in syncs if _last_run_failed(s)]
-        if not syncs:
-            if json_mode:
-                print(
-                    json.dumps(
-                        {
-                            "syncs": [],
-                            "succeeded": 0,
-                            "failed": 0,
-                            "note": "nothing_failed",
-                        },
-                        indent=2,
-                    )
-                )
-            else:
-                console.print(
-                    "[green]Nothing failed in the previous run — nothing to re-run.[/green]"
-                )
-            raise typer.Exit(0)
-        if not json_mode and not quiet:
-            console.print(
-                f"[dim]--failed: re-running {len(syncs)} sync(s): "
-                f"{', '.join(s.name for s in syncs)}[/dim]"
-            )
-
-    # --limit (#774): sampled run guards. A sampled mirror would DELETE the
-    # destination rows the sample skipped; a sampled replace would truncate
-    # a full table down to N rows. Refuse both outright.
-    if limit is not None:
-        if limit < 1:
-            print_error("--limit must be a positive integer.")
-            raise typer.Exit(1)
-        guarded = [s.name for s in syncs if s.sync.mode in ("mirror", "replace")]
-        if guarded:
-            print_error(
-                "--limit is not allowed for mode=mirror/replace syncs "
-                f"(a sample would delete or replace real rows): {', '.join(guarded)}"
-            )
-            raise typer.Exit(1)
-        if not json_mode and not quiet:
-            console.print(
-                f"[yellow]--limit {limit}: sampled run — watermarks will not advance.[/yellow]"
-            )
-
-    if full_refresh and cursor_value is not None:
-        # One says "start from nothing", the other "start from here". Silently
-        # picking a winner would make a backfill look like it worked.
-        print_error("--full-refresh and --cursor-value are mutually exclusive.")
-        raise typer.Exit(1)
-
-    if full_refresh:
-        _reset_watermarks_for(
-            syncs,
-            state_bundle.state,
-            json_mode=json_mode,
-            quiet=quiet,
-            dry_run=dry_run,
-        )
-
-    if cursor_value is not None:
-        incremental = [s for s in syncs if s.sync.mode == "incremental"]
-        if not incremental:
-            print_error(
-                "--cursor-value is only valid for incremental syncs,"
-                " but no selected syncs are incremental."
-            )
-            raise typer.Exit(1)
-        non_incremental = [s for s in syncs if s.sync.mode != "incremental"]
-        if non_incremental and not json_mode:
-            console.print(
-                f"[yellow]Warning: --cursor-value will be ignored for non-incremental "
-                f"syncs: {', '.join(s.name for s in non_incremental)}[/yellow]"
-            )
-
-    source = get_source(profile)
-    history_cfg = project.history
-    history_mgr = state_bundle.history if history_cfg.enabled else None
-
-    json_results: list[dict[str, object]] = []
+    # #778: hoisted here, before any exit path below (including the no-op
+    # "nothing to run" exits), and wrapped in try/finally so *every* one of
+    # them writes a run_results.json -- previously only the final
+    # normal-completion path did, so e.g. `--failed` with a clean prior run
+    # or `--select state:modified` with no changes left no artifact at all
+    # (Codex review). Preflight failures above this point (bad
+    # project/profile/vars) are deliberately excluded -- syncs aren't known
+    # yet, mirroring dbt's own run_results.json, which isn't written until
+    # compilation resolves a node list.
+    run_id = new_run_id()
+    invocation_started_at = datetime.now(timezone.utc).isoformat()
     t_total = time.monotonic()
+    json_results: list[dict[str, object]] = []
     succeeded = 0
     failed = 0
     skipped = 0
+    total_duration: float | None = None
+    # #778 review: disambiguates a legitimate zero-result no-op (exit 0,
+    # nothing selected/changed/failed to retry) from a *rejected* invocation
+    # (bad --limit/--full-refresh combination, unmatched selector) that also
+    # never attempts a sync -- both would otherwise write byte-identical
+    # empty-results artifacts.
+    exit_code = 0
 
-    def _skipped_entry(sync_cfg: SyncConfig) -> dict[str, object]:
-        # --fail-fast (#775): "didn't run" is distinct from "ran and failed".
-        return {
-            "name": sync_cfg.name,
-            "status": "skipped",
-            "reason": "fail_fast",
-            "rows_extracted": 0,
-            "rows_synced": 0,
-            "rows_failed": 0,
-            "duration_seconds": 0.0,
-            "dry_run": dry_run,
-        }
+    try:
+        if not syncs:
+            if not json_mode:
+                console.print("[dim]No syncs found in syncs/. Add .yml files to get started.[/dim]")
+            raise typer.Exit()
 
-    # Cooperative graceful shutdown for SIGTERM/SIGINT (#279).
-    # Signals are delivered to the main thread by Python; the engine checks
-    # stop_event between batches so the current batch always finishes cleanly,
-    # state is persisted, and then we exit. A 30s watchdog forces _exit if
-    # the current batch hangs (e.g. an unresponsive destination).
-    stop_event = threading.Event()
-    received_signal: dict[str, int | None] = {"sig": None}
-    force_timer: dict[str, threading.Timer | None] = {"t": None}
+        try:
+            if state is not None:
+                from drt.cli._state_selection import load_state_diff
 
-    def _on_signal(signum: int, _frame: Any) -> None:
-        if received_signal["sig"] is not None:
-            return  # idempotent — second signal is a no-op
-        received_signal["sig"] = signum
-        stop_event.set()
-        if not json_mode and not quiet:
-            console.print(
-                f"\n[yellow]Graceful shutdown requested "
-                f"({signal.Signals(signum).name}). "
-                f"Finishing current batch — force-exit in 30s.[/yellow]"
+                state_diff = load_state_diff(state, syncs, Path("."))
+                syncs = select_syncs(syncs, select, exclude, state_diff=state_diff)
+            else:
+                syncs = select_syncs(syncs, select, exclude)
+        except SelectionError as e:
+            print_error(str(e))
+            raise typer.Exit(1)
+        if not syncs:
+            if is_state_only_select(select):
+                # Nothing changed relative to the baseline — the normal, healthy
+                # outcome for a CI job on a PR that touched no sync definitions,
+                # not an error the way a dud tag:/bare-name selector would be.
+                if not json_mode:
+                    console.print(
+                        "[dim]No syncs changed relative to the baseline — nothing to run.[/dim]"
+                    )
+                raise typer.Exit()
+            print_error("Selection matched no syncs (after --exclude).")
+            raise typer.Exit(1)
+
+        # --failed (#773): sync-level re-run of the previous invocation's
+        # failures. Applied after --select/--exclude (intersection semantics).
+        # A clean previous state exits 0 — recovery loops shouldn't page when
+        # there is nothing to recover. (Record-level replay is `drt retry`.)
+        if failed_only:
+
+            def _last_run_failed(sync_cfg: SyncConfig) -> bool:
+                prev = state_bundle.state.get_last_sync(sync_cfg.name)
+                return prev is not None and prev.status != "success"
+
+            syncs = [s for s in syncs if _last_run_failed(s)]
+            if not syncs:
+                if json_mode:
+                    print(
+                        json.dumps(
+                            {
+                                "syncs": [],
+                                "succeeded": 0,
+                                "failed": 0,
+                                "note": "nothing_failed",
+                            },
+                            indent=2,
+                        )
+                    )
+                else:
+                    console.print(
+                        "[green]Nothing failed in the previous run — nothing to re-run.[/green]"
+                    )
+                raise typer.Exit(0)
+            if not json_mode and not quiet:
+                console.print(
+                    f"[dim]--failed: re-running {len(syncs)} sync(s): "
+                    f"{', '.join(s.name for s in syncs)}[/dim]"
+                )
+
+        # --limit (#774): sampled run guards. A sampled mirror would DELETE the
+        # destination rows the sample skipped; a sampled replace would truncate
+        # a full table down to N rows. Refuse both outright.
+        if limit is not None:
+            if limit < 1:
+                print_error("--limit must be a positive integer.")
+                raise typer.Exit(1)
+            guarded = [s.name for s in syncs if s.sync.mode in ("mirror", "replace")]
+            if guarded:
+                print_error(
+                    "--limit is not allowed for mode=mirror/replace syncs "
+                    f"(a sample would delete or replace real rows): {', '.join(guarded)}"
+                )
+                raise typer.Exit(1)
+            if not json_mode and not quiet:
+                console.print(
+                    f"[yellow]--limit {limit}: sampled run — watermarks will not advance.[/yellow]"
+                )
+
+        if full_refresh and cursor_value is not None:
+            # One says "start from nothing", the other "start from here". Silently
+            # picking a winner would make a backfill look like it worked.
+            print_error("--full-refresh and --cursor-value are mutually exclusive.")
+            raise typer.Exit(1)
+
+        if full_refresh:
+            _reset_watermarks_for(
+                syncs,
+                state_bundle.state,
+                json_mode=json_mode,
+                quiet=quiet,
+                dry_run=dry_run,
             )
-        # Watchdog: if shutdown takes > 30s, hard-exit.
-        timer = threading.Timer(30.0, lambda: os._exit(_exit_code_for_signal(signum)))
-        timer.daemon = True
-        timer.start()
-        force_timer["t"] = timer
 
-    signal.signal(signal.SIGINT, _on_signal)
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, _on_signal)
+        if cursor_value is not None:
+            incremental = [s for s in syncs if s.sync.mode == "incremental"]
+            if not incremental:
+                print_error(
+                    "--cursor-value is only valid for incremental syncs,"
+                    " but no selected syncs are incremental."
+                )
+                raise typer.Exit(1)
+            non_incremental = [s for s in syncs if s.sync.mode != "incremental"]
+            if non_incremental and not json_mode:
+                console.print(
+                    f"[yellow]Warning: --cursor-value will be ignored for non-incremental "
+                    f"syncs: {', '.join(s.name for s in non_incremental)}[/yellow]"
+                )
 
-    ctx = _RunContext(
-        source=source,
-        state_mgr=state_bundle.state,
-        history_mgr=history_mgr,
-        dlq_store=state_bundle.dlq,
-        history_retention_days=history_cfg.retention_days,
-        json_mode=json_mode,
-        dry_run=dry_run,
-        verbose=verbose,
-        quiet=quiet,
-        log_json=log_format is LogFormat.JSON,
-        cursor_value=cursor_value,
-        stop_event=stop_event,
-        compute_diff=diff,
-        diff_limit=diff_limit,
-        extract_limit=limit,
-        vars=project_vars,
-        query_tagging=project.query_tagging,
-        run_id=new_run_id(),
-        idempotency_ledger=state_bundle.ledger,
-        audit_trail=state_bundle.audit_trail,
-        audit_fields=project.state.audit_trail.fields,
-        audit_retain_days=project.state.audit_trail.retain_days or 30,
-    )
+        source = get_source(profile)
+        history_cfg = project.history
+        history_mgr = state_bundle.history if history_cfg.enabled else None
 
-    # Execute syncs — parallel if threads > 1, sequential otherwise
-    if threads > 1 and len(syncs) > 1:
-        if not json_mode and not quiet:
-            console.print(f"[dim]Running {len(syncs)} syncs with {threads} threads[/dim]\n")
-        with ThreadPoolExecutor(max_workers=threads) as pool:
-            futures = {pool.submit(_run_one, s, ctx, profile): s for s in syncs}
-            reaped: set[Future[Any]] = set()
-            for future in as_completed(futures):
-                reaped.add(future)
-                name, entry, had_err = future.result()
+        def _skipped_entry(sync_cfg: SyncConfig) -> dict[str, object]:
+            # --fail-fast (#775): "didn't run" is distinct from "ran and failed".
+            return {
+                "name": sync_cfg.name,
+                "status": "skipped",
+                "reason": "fail_fast",
+                "rows_extracted": 0,
+                "rows_synced": 0,
+                "rows_failed": 0,
+                "duration_seconds": 0.0,
+                "dry_run": dry_run,
+            }
+
+        # Cooperative graceful shutdown for SIGTERM/SIGINT (#279).
+        # Signals are delivered to the main thread by Python; the engine checks
+        # stop_event between batches so the current batch always finishes cleanly,
+        # state is persisted, and then we exit. A 30s watchdog forces _exit if
+        # the current batch hangs (e.g. an unresponsive destination).
+        stop_event = threading.Event()
+        received_signal: dict[str, int | None] = {"sig": None}
+        force_timer: dict[str, threading.Timer | None] = {"t": None}
+
+        def _on_signal(signum: int, _frame: Any) -> None:
+            if received_signal["sig"] is not None:
+                return  # idempotent — second signal is a no-op
+            received_signal["sig"] = signum
+            stop_event.set()
+            if not json_mode and not quiet:
+                console.print(
+                    f"\n[yellow]Graceful shutdown requested "
+                    f"({signal.Signals(signum).name}). "
+                    f"Finishing current batch — force-exit in 30s.[/yellow]"
+                )
+            # Watchdog: if shutdown takes > 30s, hard-exit.
+            timer = threading.Timer(30.0, lambda: os._exit(_exit_code_for_signal(signum)))
+            timer.daemon = True
+            timer.start()
+            force_timer["t"] = timer
+
+        signal.signal(signal.SIGINT, _on_signal)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, _on_signal)
+
+        ctx = _RunContext(
+            source=source,
+            state_mgr=state_bundle.state,
+            history_mgr=history_mgr,
+            dlq_store=state_bundle.dlq,
+            history_retention_days=history_cfg.retention_days,
+            json_mode=json_mode,
+            dry_run=dry_run,
+            verbose=verbose,
+            quiet=quiet,
+            log_json=log_format is LogFormat.JSON,
+            cursor_value=cursor_value,
+            stop_event=stop_event,
+            compute_diff=diff,
+            diff_limit=diff_limit,
+            extract_limit=limit,
+            vars=project_vars,
+            query_tagging=project.query_tagging,
+            run_id=run_id,
+            idempotency_ledger=state_bundle.ledger,
+            audit_trail=state_bundle.audit_trail,
+            audit_fields=project.state.audit_trail.fields,
+            audit_retain_days=project.state.audit_trail.retain_days or 30,
+        )
+
+        # Execute syncs — parallel if threads > 1, sequential otherwise
+        if threads > 1 and len(syncs) > 1:
+            if not json_mode and not quiet:
+                console.print(f"[dim]Running {len(syncs)} syncs with {threads} threads[/dim]\n")
+            with ThreadPoolExecutor(max_workers=threads) as pool:
+                futures = {pool.submit(_run_one, s, ctx, profile): s for s in syncs}
+                reaped: set[Future[Any]] = set()
+                for future in as_completed(futures):
+                    reaped.add(future)
+                    name, entry, had_err = future.result()
+                    json_results.append(entry)
+                    if had_err:
+                        failed += 1
+                        if fail_fast:
+                            # Stop scheduling, then STOP ITERATING as_completed().
+                            #
+                            # shutdown(cancel_futures=True) calls Future.cancel() on
+                            # everything still queued, but a future cancelled that way
+                            # never reaches as_completed()'s waiter — the waiter is only
+                            # notified from set_running_or_notify_cancel(), which a worker
+                            # calls when it *picks up* the item, and these items were pulled
+                            # off the queue instead. Staying in the loop would block forever
+                            # waiting for futures that can never be delivered.
+                            pool.shutdown(wait=False, cancel_futures=True)
+                            break
+                    else:
+                        succeeded += 1
+
+                # Reap what the loop above didn't: cancelled futures (never started —
+                # report them as skipped) and in-flight ones (let them drain; the
+                # with-block would wait for them regardless).
+                for future, sync in futures.items():
+                    if future in reaped:
+                        continue
+                    if future.cancelled():
+                        json_results.append(_skipped_entry(sync))
+                        skipped += 1
+                        continue
+                    name, entry, had_err = future.result()
+                    json_results.append(entry)
+                    if had_err:
+                        failed += 1
+                    else:
+                        succeeded += 1
+        else:
+            stop_scheduling = False
+            for sync in syncs:
+                if stop_scheduling:
+                    json_results.append(_skipped_entry(sync))
+                    skipped += 1
+                    continue
+                name, entry, had_err = _run_one(sync, ctx, profile)
                 json_results.append(entry)
                 if had_err:
                     failed += 1
                     if fail_fast:
-                        # Stop scheduling, then STOP ITERATING as_completed().
-                        #
-                        # shutdown(cancel_futures=True) calls Future.cancel() on
-                        # everything still queued, but a future cancelled that way
-                        # never reaches as_completed()'s waiter — the waiter is only
-                        # notified from set_running_or_notify_cancel(), which a worker
-                        # calls when it *picks up* the item, and these items were pulled
-                        # off the queue instead. Staying in the loop would block forever
-                        # waiting for futures that can never be delivered.
-                        pool.shutdown(wait=False, cancel_futures=True)
-                        break
+                        stop_scheduling = True
                 else:
                     succeeded += 1
 
-            # Reap what the loop above didn't: cancelled futures (never started —
-            # report them as skipped) and in-flight ones (let them drain; the
-            # with-block would wait for them regardless).
-            for future, sync in futures.items():
-                if future in reaped:
-                    continue
-                if future.cancelled():
-                    json_results.append(_skipped_entry(sync))
-                    skipped += 1
-                    continue
-                name, entry, had_err = future.result()
-                json_results.append(entry)
-                if had_err:
-                    failed += 1
-                else:
-                    succeeded += 1
-    else:
-        stop_scheduling = False
-        for sync in syncs:
-            if stop_scheduling:
-                json_results.append(_skipped_entry(sync))
-                skipped += 1
-                continue
-            name, entry, had_err = _run_one(sync, ctx, profile)
-            json_results.append(entry)
-            if had_err:
-                failed += 1
-                if fail_fast:
-                    stop_scheduling = True
-            else:
-                succeeded += 1
-
-    if skipped and not json_mode and not quiet:
-        console.print(
-            f"[yellow]--fail-fast: skipped {skipped} sync(s) after the first failure.[/yellow]"
-        )
-
-    total_duration = round(time.monotonic() - t_total, 2)
-
-    # Summary report
-    if not json_mode and not quiet and len(syncs) > 1:
-        console.print(
-            f"\n[bold]Summary:[/bold] {succeeded} succeeded, {failed} failed, "
-            f"{total_duration}s total"
-        )
-
-    if not json_mode and not quiet:
-        _print_watermark_summary(json_results)
-
-    if json_mode:
-        print(
-            json.dumps(
-                {
-                    "run_id": ctx.run_id,
-                    "syncs": json_results,
-                    "succeeded": succeeded,
-                    "failed": failed,
-                    "skipped": skipped,
-                    "total_duration_seconds": total_duration,
-                },
-                indent=2,
-            )
-        )
-
-    # Graceful shutdown path (#279) takes precedence over the failure exit
-    # code: even if some syncs reported failures before the signal arrived,
-    # the operator's intent was "stop now", and the SIGTERM/SIGINT exit code
-    # carries that information.
-    if received_signal["sig"] is not None:
-        if force_timer["t"] is not None:
-            force_timer["t"].cancel()
-        if not json_mode and not quiet:
+        if skipped and not json_mode and not quiet:
             console.print(
-                f"[yellow]Stopped after {succeeded + failed} sync(s). State persisted.[/yellow]"
+                f"[yellow]--fail-fast: skipped {skipped} sync(s) after the first failure.[/yellow]"
             )
-        raise typer.Exit(_exit_code_for_signal(received_signal["sig"]))
 
-    if failed > 0:
-        raise typer.Exit(1)
+        total_duration = round(time.monotonic() - t_total, 2)
+
+        # Summary report
+        if not json_mode and not quiet and len(syncs) > 1:
+            console.print(
+                f"\n[bold]Summary:[/bold] {succeeded} succeeded, {failed} failed, "
+                f"{total_duration}s total"
+            )
+
+        if not json_mode and not quiet:
+            _print_watermark_summary(json_results)
+
+        if json_mode:
+            print(
+                json.dumps(
+                    {
+                        "run_id": ctx.run_id,
+                        "syncs": json_results,
+                        "succeeded": succeeded,
+                        "failed": failed,
+                        "skipped": skipped,
+                        "total_duration_seconds": total_duration,
+                    },
+                    indent=2,
+                )
+            )
+
+        # Graceful shutdown path (#279) takes precedence over the failure exit
+        # code: even if some syncs reported failures before the signal arrived,
+        # the operator's intent was "stop now", and the SIGTERM/SIGINT exit code
+        # carries that information.
+        if received_signal["sig"] is not None:
+            if force_timer["t"] is not None:
+                force_timer["t"].cancel()
+            if not json_mode and not quiet:
+                console.print(
+                    f"[yellow]Stopped after {succeeded + failed} sync(s). State persisted.[/yellow]"
+                )
+            raise typer.Exit(_exit_code_for_signal(received_signal["sig"]))
+
+        if failed > 0:
+            raise typer.Exit(1)
+    except typer.Exit as exc:
+        exit_code = exc.exit_code if exc.exit_code is not None else 0
+        raise
+    except BaseException:
+        exit_code = 1
+        raise
+    finally:
+        _write_run_results(
+            target_path,
+            run_id=run_id,
+            started_at=invocation_started_at,
+            results=[_sanitize_entry_for_artifact(e) for e in json_results],
+            succeeded=succeeded,
+            failed=failed,
+            skipped=skipped,
+            total_duration=(
+                total_duration
+                if total_duration is not None
+                else round(time.monotonic() - t_total, 2)
+            ),
+            exit_code=exit_code,
+        )

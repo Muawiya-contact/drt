@@ -1,0 +1,491 @@
+"""Tests for `target/drt/run_results.json` (#778) — a durable, machine-readable
+per-invocation record, dbt's `run_results.json` pattern.
+
+Defaults to `target/drt`, not dbt's own `target/`, so the documented
+co-located `dbt run && drt run` workflow (docs/guides/using-with-dbt.md)
+doesn't clobber dbt's own `target/run_results.json`.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+from typer.testing import CliRunner
+
+from drt import __version__
+from drt.cli.main import app
+
+runner = CliRunner()
+
+
+@pytest.fixture
+def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.chdir(tmp_path)
+    home = tmp_path / ".drt_home"
+    home.mkdir()
+    monkeypatch.setattr("drt.config.credentials._config_dir", lambda override=None: home)
+    (home / "profiles.yml").write_text(
+        yaml.safe_dump({"profiles": {"dev": {"type": "duckdb", "database": ":memory:"}}})
+    )
+    (tmp_path / "syncs").mkdir()
+    (tmp_path / "drt_project.yml").write_text(
+        yaml.safe_dump({"name": "p", "profile": "dev", "version": "1"})
+    )
+    (tmp_path / "syncs" / "users.yml").write_text(
+        yaml.safe_dump(
+            {
+                "name": "users",
+                "model": "SELECT 1 AS id",
+                "destination": {
+                    "type": "file",
+                    "format": "csv",
+                    "path": str(tmp_path / "out.csv"),
+                },
+            }
+        )
+    )
+    return tmp_path
+
+
+def test_written_by_default_text_mode(project: Path) -> None:
+    """Written unconditionally, independent of --output — the whole point
+    is a durable record even when JSON wasn't requested on stdout."""
+    result = runner.invoke(app, ["run", "--select", "users"])
+    assert result.exit_code == 0
+
+    artifact_path = project / "target" / "drt" / "run_results.json"
+    assert artifact_path.exists()
+    data = json.loads(artifact_path.read_text())
+    assert data["schema_version"] == 1
+    assert data["invocation"]["succeeded"] == 1
+    assert data["invocation"]["failed"] == 0
+    assert data["invocation"]["skipped"] == 0
+    assert data["invocation"]["drt_version"] == __version__
+    assert data["invocation"]["argv"] == sys.argv
+    assert isinstance(data["invocation"]["run_id"], str) and data["invocation"]["run_id"]
+    assert isinstance(data["invocation"]["duration_seconds"], (int, float))
+    assert data["invocation"]["started_at"] < data["invocation"]["completed_at"]
+    assert len(data["results"]) == 1
+    assert data["results"][0]["name"] == "users"
+    assert data["results"][0]["status"] == "success"
+
+
+def test_matches_output_json_syncs_entries(project: Path) -> None:
+    """The artifact's `results` reuse the exact same per-sync entries
+    --output json already prints — one source of truth, not two shapes."""
+    result = runner.invoke(app, ["run", "--select", "users", "--output", "json"])
+    stdout_data = json.loads(result.output)
+
+    artifact_data = json.loads((project / "target" / "drt" / "run_results.json").read_text())
+
+    assert artifact_data["results"] == stdout_data["syncs"]
+    assert artifact_data["invocation"]["run_id"] == stdout_data["run_id"]
+    assert artifact_data["invocation"]["succeeded"] == stdout_data["succeeded"]
+    assert artifact_data["invocation"]["failed"] == stdout_data["failed"]
+    assert artifact_data["invocation"]["skipped"] == stdout_data["skipped"]
+    assert artifact_data["invocation"]["duration_seconds"] == stdout_data["total_duration_seconds"]
+
+
+def test_target_path_option_redirects_the_write(project: Path) -> None:
+    result = runner.invoke(app, ["run", "--select", "users", "--target-path", "custom_target"])
+    assert result.exit_code == 0
+    assert (project / "custom_target" / "run_results.json").exists()
+    assert not (project / "target" / "drt" / "run_results.json").exists()
+
+
+def test_written_even_when_a_sync_fails(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Best-effort bookkeeping must not depend on the run's own success --
+    the artifact is exactly what a CI system needs to inspect *why* a run
+    failed."""
+    (project / "syncs" / "broken.yml").write_text(
+        yaml.safe_dump(
+            {
+                "name": "broken",
+                "model": "SELECT 1 AS id",
+                "destination": {
+                    "type": "file",
+                    "format": "csv",
+                    "path": "/nonexistent/dir/out.csv",
+                },
+            }
+        )
+    )
+
+    result = runner.invoke(app, ["run"])
+    assert result.exit_code == 1
+
+    data = json.loads((project / "target" / "drt" / "run_results.json").read_text())
+    assert data["invocation"]["failed"] == 1
+    statuses = {entry["name"]: entry["status"] for entry in data["results"]}
+    assert statuses["broken"] != "success"
+    assert statuses["users"] == "success"
+
+
+def test_write_failure_does_not_change_exit_code(project: Path) -> None:
+    """A failure writing the artifact (here: a plain file already occupies
+    the target directory's name, so `mkdir` raises `FileExistsError`, an
+    `OSError` subclass -- standing in for a permissions/disk-full failure)
+    must never mask the real run outcome or crash the command."""
+    (project / "target").write_text("not a directory")
+
+    result = runner.invoke(app, ["run", "--select", "users"])
+
+    assert result.exit_code == 0
+    assert (project / "target").read_text() == "not a directory"  # untouched, not overwritten
+
+
+def test_written_on_no_op_exit(project: Path) -> None:
+    """--failed against a fresh project (no prior run to have failed) exits
+    0 via an early `raise typer.Exit(0)` before the dispatch loop ever runs
+    -- one of the successful no-op paths a first review round found were
+    skipping the artifact write entirely (Codex review, #778 PR)."""
+    result = runner.invoke(app, ["run", "--failed"])
+    assert result.exit_code == 0
+    assert "Nothing failed" in result.output
+
+    artifact_path = project / "target" / "drt" / "run_results.json"
+    assert artifact_path.exists()
+    data = json.loads(artifact_path.read_text())
+    assert data["invocation"]["exit_code"] == 0
+    assert data["invocation"]["succeeded"] == 0
+    assert data["invocation"]["failed"] == 0
+    assert data["invocation"]["skipped"] == 0
+    assert data["results"] == []
+
+
+def test_exit_code_distinguishes_rejected_invocation_from_a_clean_no_op(project: Path) -> None:
+    """A rejected invocation (here: --limit 0) never attempts a sync either,
+    so its results/counts look byte-identical to the clean no-op above --
+    exit_code is what tells a CI/observability consumer these two 0/0/0
+    artifacts are not the same outcome (Codex review, #778 PR round 2)."""
+    result = runner.invoke(app, ["run", "--select", "users", "--limit", "0"])
+    assert result.exit_code == 1
+
+    data = json.loads((project / "target" / "drt" / "run_results.json").read_text())
+    assert data["invocation"]["exit_code"] == 1
+    assert data["invocation"]["succeeded"] == 0
+    assert data["invocation"]["failed"] == 0
+    assert data["invocation"]["skipped"] == 0
+    assert data["results"] == []
+
+
+def test_error_field_dropped_from_artifact_but_kept_in_stdout(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A heuristic keyword sweep has no fixed point against arbitrary
+    connector-exception text -- a #778 review round after round kept
+    finding a new bypass (unquoted multi-word values, quoted dict-repr
+    keys, comma-embedded values, compound identifiers like `client_secret`)
+    for whatever the sweep had just been widened to catch. `error` (raw
+    `str(exception)`) is dropped from the artifact outright instead of
+    redacted -- `error_type`/`error_stage`/`error_suggestion` are bounded
+    vocabulary and stay, giving a CI consumer stage + exception class
+    without the free text. Unlike the persisted artifact, `--output json`
+    stdout and the console render are existing, non-uploaded consumers, so
+    `error` stays there, unredacted, exactly as before #778."""
+    from drt.engine import sync as sync_module
+
+    def _boom(*_a: object, **_k: object) -> None:
+        raise RuntimeError("connection to postgres://user:hunter2@db.internal:5432 failed")
+
+    monkeypatch.setattr(sync_module, "run_sync", _boom, raising=False)
+
+    result = runner.invoke(app, ["run", "--select", "users", "--output", "json"])
+    assert result.exit_code == 1
+    stdout_data = json.loads(result.output)
+    stdout_entry = stdout_data["syncs"][0]
+    assert "hunter2" in stdout_entry["error"]  # unredacted, unchanged, for existing consumers
+
+    data = json.loads((project / "target" / "drt" / "run_results.json").read_text())
+    artifact_entry = data["results"][0]
+    assert "error" not in artifact_entry
+    assert artifact_entry["error_type"] == stdout_entry["error_type"]
+    assert artifact_entry["error_stage"] == stdout_entry["error_stage"]
+    assert artifact_entry == {k: v for k, v in stdout_entry.items() if k != "error"}
+
+
+def test_argv_is_redacted(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """--vars values reach argv verbatim; unlike stdout, this artifact is a
+    durable file recommended for CI upload, so a sensitive --vars value must
+    not be persisted as-is (Codex review, #778 PR round 2). CliRunner.invoke
+    doesn't touch the real process `sys.argv` (it dispatches in-process), so
+    it's patched here to look like the invocation actually being tested."""
+    monkeypatch.setattr(sys, "argv", ["drt", "run", "--vars", "api_key: super-secret-value"])
+    result = runner.invoke(
+        app, ["run", "--select", "users", "--vars", "api_key: super-secret-value"]
+    )
+    assert result.exit_code == 0
+
+    data = json.loads((project / "target" / "drt" / "run_results.json").read_text())
+    argv_text = " ".join(data["invocation"]["argv"])
+    assert "super-secret-value" not in argv_text
+    assert "« redacted »" in argv_text
+
+
+def test_argv_vars_value_redacted_whole_regardless_of_key_name(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--vars carries arbitrary, project-defined variable names -- a fixed
+    keyword list (password/token/api_key/...) can never anticipate every
+    project's own names, so `stripe_key: sk_live_...` sailed through the
+    free-text heuristic sweep untouched (Codex review, #778 PR round 3). The
+    whole value after --vars is now redacted outright, key name or not, in
+    both the `--vars value` and `--vars=value` forms."""
+    monkeypatch.setattr(sys, "argv", ["drt", "run", "--vars", "stripe_key: sk_live_abc123"])
+    result = runner.invoke(
+        app, ["run", "--select", "users", "--vars", "stripe_key: sk_live_abc123"]
+    )
+    assert result.exit_code == 0
+    data = json.loads((project / "target" / "drt" / "run_results.json").read_text())
+    argv_text = " ".join(data["invocation"]["argv"])
+    assert "sk_live_abc123" not in argv_text
+    assert "stripe_key" not in argv_text
+    assert "« redacted »" in argv_text
+
+    monkeypatch.setattr(sys, "argv", ["drt", "run", "--vars=stripe_key: sk_live_abc123"])
+    result = runner.invoke(app, ["run", "--select", "users", "--vars=stripe_key: sk_live_abc123"])
+    assert result.exit_code == 0
+    data = json.loads((project / "target" / "drt" / "run_results.json").read_text())
+    argv_text = " ".join(data["invocation"]["argv"])
+    assert "sk_live_abc123" not in argv_text
+    assert "--vars=« redacted »" in argv_text
+
+
+def test_diff_with_non_json_native_values_does_not_crash(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A diff sample can carry warehouse-native datetime/Decimal/UUID values
+    `json.dumps` can't serialize natively; this must degrade to a readable
+    string, not turn an otherwise-successful preview into a crash (Codex
+    review, #778 PR round 2)."""
+    from datetime import datetime as dt
+
+    from drt.engine import diff as diff_mod
+    from drt.engine import sync as sync_module
+
+    sample_diff = diff_mod.DiffResult(
+        sample=[{"id": 1, "created_at": dt(2026, 1, 1)}],
+        total_source_rows=1,
+        supported=False,
+        fallback_reason="file: no comparison available",
+    )
+
+    class _FakeResult:
+        success = 1
+        failed = 0
+        skipped = 0
+        skipped_no_match = 0
+        rows_extracted = 1
+        row_errors: list[Any] = []
+        errors: list[str] = []
+        watermark_source: str | None = None
+        cursor_value_used: str | None = None
+        watermark_lag: str | None = None
+        limit_applied: int | None = None
+        duration_seconds = 0.01
+        interrupted = False
+        run_id: str | None = None
+        sync_run_id: str | None = "fake-sync-run-id"
+        diff: Any = sample_diff
+
+    monkeypatch.setattr(sync_module, "run_sync", lambda *_a, **_k: _FakeResult(), raising=False)
+
+    result = runner.invoke(app, ["run", "--select", "users", "--dry-run", "--diff"])
+    assert result.exit_code == 0
+
+    data = json.loads((project / "target" / "drt" / "run_results.json").read_text())
+    sample = data["results"][0]["diff"]["sample"]
+    assert sample == [{"id": 1, "created_at": "2026-01-01 00:00:00"}]
+
+
+def test_text_mode_diff_included_in_artifact(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plain-text `--dry-run --diff` run (no --output json) must still
+    carry diff data in the artifact -- the documented contract is that the
+    artifact is independent of --output, but `entry["diff"]` used to be
+    populated only `if ctx.json_mode` (Codex review, #778 PR)."""
+    from drt.engine import diff as diff_mod
+    from drt.engine import sync as sync_module
+
+    sample_diff = diff_mod.DiffResult(
+        sample=[{"id": 1}],
+        total_source_rows=1,
+        supported=False,
+        fallback_reason="file: no comparison available",
+    )
+
+    class _FakeResult:
+        success = 1
+        failed = 0
+        skipped = 0
+        skipped_no_match = 0
+        rows_extracted = 1
+        row_errors: list[Any] = []
+        errors: list[str] = []
+        watermark_source: str | None = None
+        cursor_value_used: str | None = None
+        watermark_lag: str | None = None
+        limit_applied: int | None = None
+        duration_seconds = 0.01
+        interrupted = False
+        run_id: str | None = None
+        sync_run_id: str | None = "fake-sync-run-id"
+        diff: Any = sample_diff
+
+    monkeypatch.setattr(sync_module, "run_sync", lambda *_a, **_k: _FakeResult(), raising=False)
+
+    result = runner.invoke(app, ["run", "--select", "users", "--dry-run", "--diff"])
+    assert result.exit_code == 0
+
+    data = json.loads((project / "target" / "drt" / "run_results.json").read_text())
+    entry = data["results"][0]
+    assert entry["diff"]["supported"] is False
+    assert entry["diff"]["fallback_reason"] == "file: no comparison available"
+
+
+def test_diff_unavailable_reason_replaced_in_artifact_but_kept_in_stdout(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`delete_preview_unavailable_reason` comes from
+    `f"{type(error).__name__}: {error}"` around a failed destination/state
+    read (drt/engine/diff.py) -- raw connector-exception text, same class
+    `error` is, and existing tests (test_diff.py) pin its exact format for
+    console/`--output json` display, so it can't be sanitized at the
+    source. The artifact instead replaces it with a fixed placeholder
+    (not null -- null already means "the delete read succeeded", and the
+    two outcomes must stay distinguishable) (Codex review, #778 PR rounds
+    4-6)."""
+    from drt.engine import diff as diff_mod
+    from drt.engine import sync as sync_module
+
+    sample_diff = diff_mod.DiffResult(
+        sample=[],
+        total_source_rows=1,
+        supported=True,
+        total_destination_rows=0,
+        added=[],
+        updated=[],
+        deleted=[],
+        delete_reason="mirror",
+        delete_preview_unavailable_reason=(
+            "OperationalError: connection to postgres://drt:hunter2@db.internal:5432 failed"
+        ),
+    )
+
+    class _FakeResult:
+        success = 1
+        failed = 0
+        skipped = 0
+        skipped_no_match = 0
+        rows_extracted = 1
+        row_errors: list[Any] = []
+        errors: list[str] = []
+        watermark_source: str | None = None
+        cursor_value_used: str | None = None
+        watermark_lag: str | None = None
+        limit_applied: int | None = None
+        duration_seconds = 0.01
+        interrupted = False
+        run_id: str | None = None
+        sync_run_id: str | None = "fake-sync-run-id"
+        diff: Any = sample_diff
+
+    monkeypatch.setattr(sync_module, "run_sync", lambda *_a, **_k: _FakeResult(), raising=False)
+
+    result = runner.invoke(
+        app, ["run", "--select", "users", "--dry-run", "--diff", "--output", "json"]
+    )
+    assert result.exit_code == 0
+    stdout_data = json.loads(result.output)
+    stdout_reason = stdout_data["syncs"][0]["diff"]["delete_preview_unavailable_reason"]
+    assert "hunter2" in stdout_reason  # unredacted, unchanged, for existing consumers
+
+    data = json.loads((project / "target" / "drt" / "run_results.json").read_text())
+    artifact_reason = data["results"][0]["diff"]["delete_preview_unavailable_reason"]
+    assert artifact_reason is not None  # still distinguishable from "read succeeded"
+    assert "hunter2" not in artifact_reason
+    assert "db.internal" not in artifact_reason
+
+
+def test_stale_artifact_cleared_on_preflight_failure(project: Path) -> None:
+    """A prior successful run's artifact must not linger to be silently
+    re-uploaded by a CI job's `if: always()` step as if it were the current
+    (failed) invocation's result. A preflight failure (--diff without
+    --dry-run here) never reaches the try/finally that writes a fresh
+    artifact -- syncs aren't known yet -- so the stale one must be cleared
+    up front instead (Codex review, #778 PR round 4)."""
+    good = runner.invoke(app, ["run", "--select", "users"])
+    assert good.exit_code == 0
+    artifact_path = project / "target" / "drt" / "run_results.json"
+    assert artifact_path.exists()
+
+    rejected = runner.invoke(app, ["run", "--diff"])
+    assert rejected.exit_code == 1
+    assert not artifact_path.exists()
+
+
+def test_setup_failure_before_run_sync_is_recorded_not_uncaught(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure in per-sync setup (permission check, destination/watermark/
+    observer construction) used to propagate out of `_run_one` entirely
+    uncaught -- the sync got no entry at all, and in a multi-sync run any
+    later syncs in a sequential dispatch were silently never attempted
+    either, while the artifact (written from the outer `finally`) still
+    claimed `exit_code: 1` with nothing to show why (Codex review, #778 PR
+    round 6). `_run_one`'s try now wraps setup too, so it always returns a
+    structured entry."""
+    from drt.cli.commands import run as run_module
+
+    def _boom(*_a: object, **_k: object) -> Any:
+        raise RuntimeError("destination config rejected: bad table name")
+
+    monkeypatch.setattr(run_module, "get_destination", _boom)
+
+    result = runner.invoke(app, ["run", "--select", "users"])
+    assert result.exit_code == 1
+
+    data = json.loads((project / "target" / "drt" / "run_results.json").read_text())
+    assert data["invocation"]["exit_code"] == 1
+    assert data["invocation"]["failed"] == 1
+    assert len(data["results"]) == 1
+    entry = data["results"][0]
+    assert entry["name"] == "users"
+    assert entry["status"] == "failed"
+    assert "error" not in entry
+    assert entry["error_type"] == "RuntimeError"
+
+
+def test_write_is_atomic_no_partial_file_on_write_failure(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write failure (disk-full, interrupted) must never leave a
+    truncated/invalid file at the final path for the documented
+    `if: always()` CI step to upload -- the write goes through a temporary
+    sibling and an atomic rename, so a failure partway through only ever
+    touches the *temp* file, cleaned up on the way out (Codex review, #778
+    PR round 5)."""
+    final_path = project / "target" / "drt" / "run_results.json"
+    real_write_text = Path.write_text
+
+    def _flaky_write_text(self: Path, *args: object, **kwargs: object) -> int:
+        # Suffixed with a run_id (round 6) rather than a fixed name -- match
+        # by the stable prefix/suffix instead of the exact filename.
+        if self.name.startswith(".run_results.json.") and self.name.endswith(".tmp"):
+            raise OSError("simulated disk-full mid-write")
+        return real_write_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "write_text", _flaky_write_text)
+
+    result = runner.invoke(app, ["run", "--select", "users"])
+
+    assert result.exit_code == 0  # bookkeeping failure never masks the run's own outcome
+    assert not final_path.exists()
+    leftover_tmp_files = list((project / "target" / "drt").glob(".run_results.json.*.tmp"))
+    assert leftover_tmp_files == []
