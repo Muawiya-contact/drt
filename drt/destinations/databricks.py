@@ -49,7 +49,6 @@ Example sync YAML:
 from __future__ import annotations
 
 import json
-import re
 from datetime import timedelta
 from typing import Any
 
@@ -144,18 +143,18 @@ def _bind_row(row: dict[str, Any], columns: list[str], json_columns: list[str]) 
 # markers per statement — multi-row INSERT chunks must stay under it (#734).
 _NATIVE_PARAM_LIMIT = 255
 
-_LITERAL_DEFAULT = re.compile(
-    r"(?:NULL|TRUE|FALSE|[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|'(?:''|[^'])*')",
-    re.IGNORECASE,
-)
 
+def _target_default_expression(default: Any) -> str | None:
+    """Return a declared target DEFAULT expression, or ``None`` when absent.
 
-def _literal_default(default: Any) -> str | None:
-    """Return a safe SQL literal default, or ``None`` for NULL/non-literals."""
+    The expression comes directly from Databricks' table metadata, not the
+    incoming record. Re-emitting it in the MERGE lets sparse rows preserve both
+    literal defaults and supported expressions such as ``current_timestamp()``.
+    """
     if default is None:
         return None
     value = str(default).strip()
-    return value if _LITERAL_DEFAULT.fullmatch(value) else None
+    return value or None
 
 
 def _presence_flags(columns: list[str], target_columns: set[str]) -> dict[str, str]:
@@ -215,7 +214,8 @@ class DatabricksDestination(BaseSqlDestination):
 
         ``CREATE TABLE AS SELECT`` creates an empty Delta staging table but
         strips target ``DEFAULT`` clauses.  We therefore read the metadata from
-        the target itself and use literal defaults in the final, single MERGE.
+        the target itself and use its declared DEFAULT expressions in the final,
+        single MERGE.
         """
         if config.table not in self._column_default_cache:
             # INFORMATION_SCHEMA.COLUMNS.COLUMN_DEFAULT is permanently NULL
@@ -558,10 +558,14 @@ class DatabricksDestination(BaseSqlDestination):
                 for column in update_cols
             )
             insert_cols = ", ".join(columns)
+            insert_defaults = {
+                column: _target_default_expression(target_defaults.get(column.lower())) or "NULL"
+                for column in update_cols
+            }
             insert_vals = ", ".join(
                 (
                     f"CASE WHEN source.{flags[column]} THEN source.{column} "
-                    f"ELSE {_literal_default(target_defaults.get(column.lower())) or 'NULL'} END"
+                    f"ELSE {insert_defaults[column]} END"
                 )
                 if column in flags
                 else f"source.{column}"

@@ -424,6 +424,43 @@ class TestDatabricksDestinationLoad:
         merge_sql = next(s for s in sqls if s.startswith("MERGE INTO main.default.user_scores"))
         assert "source.__drt_has_note_1" in merge_sql
 
+    def test_heterogeneous_merge_preserves_expression_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Sparse inserts must retain defaults such as ``current_timestamp()``."""
+        _set_creds(monkeypatch)
+        conn = _fake_conn()
+        conn._cur.fetchall.return_value = [
+            (
+                json.dumps(
+                    {
+                        "columns": [
+                            {"name": "id"},
+                            {"name": "created_at", "default": "current_timestamp()"},
+                        ]
+                    }
+                ),
+            )
+        ]
+        modules = _mocked_databricks_modules(conn)
+
+        with patch.dict("sys.modules", modules):
+            DatabricksDestination().load(
+                [{"id": 1}, {"id": 2, "created_at": "2026-09-24T00:00:00Z"}],
+                _config(mode="merge", upsert_key=["id"]),
+                _options(),
+            )
+
+        merge_sql = next(
+            call.args[0]
+            for call in conn._cur.execute.call_args_list
+            if call.args and call.args[0].startswith("MERGE INTO main.default.user_scores")
+        )
+        assert (
+            "CASE WHEN source.__drt_has_created_at THEN source.created_at "
+            "ELSE current_timestamp() END"
+        ) in merge_sql
+
     def test_wide_merge_keeps_literal_flags_out_of_parameter_budget(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
