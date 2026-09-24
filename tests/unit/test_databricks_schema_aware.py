@@ -217,6 +217,32 @@ def test_merge_staging_path_wraps() -> None:
     assert "from_json(?, 'array<string>')" in staging
 
 
+def test_merge_json_staging_records_a_row_error() -> None:
+    """A rejected JSON staging row respects the normal ``on_error`` contract."""
+
+    class RejectingStagingCursor(_FakeCursor):
+        def execute(self, sql: str, params: Any = None) -> None:
+            super().execute(sql, params)
+            if sql.startswith("INSERT INTO main.default.__drt_staging"):
+                raise RuntimeError("invalid JSON payload")
+
+    dest = DatabricksDestination()
+    cur = RejectingStagingCursor()
+    dest._connect = lambda c, **_kw: _FakeConn(cur)  # type: ignore[method-assign]
+    dest._schema_cache = {"t": {"id": "scalar", "tags": "json"}}
+    dest._ddl_cache = {"t": {"tags": "array<string>"}}
+
+    result = dest.load(
+        [{"id": 1, "tags": ["x"]}],
+        _cfg(mode="merge", upsert_key=["id"]),
+        SyncOptions(on_error="skip"),
+    )
+
+    assert result.success == 0
+    assert result.failed == 1
+    assert result.row_errors[0].error_message == "invalid JSON payload"
+
+
 def test_from_json_ddl_single_quotes_are_escaped() -> None:
     """A DDL containing a single quote must be doubled so it can't break the literal (#703)."""
     clause, _ = _value_clause(["c"], {"c": "json"}, {"c": "struct<n: string, it's: int>"})
