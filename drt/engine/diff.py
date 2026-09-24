@@ -31,13 +31,38 @@ from drt.destinations.query import (
 )
 
 
+class _ResetToDestinationDefault:
+    """Sentinel for a replace-mode column whose destination default is unknown.
+
+    A record that omits a column during ``sync.mode: replace`` rebuilds that
+    row from the source record. The resulting value is the destination's
+    actual default, which the diff engine does not introspect; it is not
+    necessarily ``None``.
+    """
+
+    def __repr__(self) -> str:
+        return "<default>"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _ResetToDestinationDefault)
+
+    def __hash__(self) -> int:
+        return hash(_ResetToDestinationDefault)
+
+
+RESET_TO_DESTINATION_DEFAULT = _ResetToDestinationDefault()
+
+
 @dataclass
 class DiffResult:
     """Result of a record-level diff between source records and destination state.
 
-    For queryable destinations, ``added`` / ``updated`` / ``deleted`` reflect
-    the real comparison. For non-queryable destinations, only ``sample`` is
-    populated (with ``supported=False`` and ``fallback_reason`` set).
+    For queryable destinations, ``added`` / ``updated`` / ``replaced`` /
+    ``inserted`` / ``deleted`` reflect the real write shape. ``added`` is a
+    new key from an upsert-style write; ``inserted`` is an append-only physical
+    insert, even when its key already exists. For non-queryable destinations,
+    only ``sample`` is populated (with ``supported=False`` and
+    ``fallback_reason`` set).
 
     ``deleted`` rows carry full destination columns in ``replace`` mode; for both
     mirror previews (#693) they carry the ``upsert_key`` columns only, since those
@@ -70,13 +95,18 @@ class DiffResult:
     added: list[dict[str, Any]] = field(default_factory=list)
     updated: list[tuple[dict[str, Any], dict[str, Any]]] = field(default_factory=list)
     deleted: list[dict[str, Any]] = field(default_factory=list)
+    # Kept after the legacy lists so existing positional constructors retain
+    # their original ``added, updated, deleted`` ordering.
+    replaced: list[tuple[dict[str, Any], dict[str, Any]]] = field(default_factory=list)
+    inserted: list[dict[str, Any]] = field(default_factory=list)
 
     # Fallback fields (non-queryable destinations)
     sample: list[dict[str, Any]] = field(default_factory=list)
 
     # Metadata
     total_source_rows: int = 0
-    total_destination_rows: int = 0  # only meaningful when supported
+    # ``None`` means append-only rows did not need a destination read.
+    total_destination_rows: int | None = 0
     truncated: bool = False
     supported: bool = True
     fallback_reason: str | None = None
@@ -84,20 +114,54 @@ class DiffResult:
     # Defaults to None so pre-existing callers keep the legacy rendering.
     delete_reason: str | None = None
     delete_preview_unavailable_reason: str | None = None
+    # A replace write rebuilds each existing row from its source record.
+    # Omitted fields are therefore resets, unlike a partial update.
+    writes_full_row: bool = False
 
     @staticmethod
-    def changed_fields(old: dict[str, Any], new: dict[str, Any]) -> dict[str, tuple[Any, Any]]:
+    def changed_fields(
+        old: dict[str, Any], new: dict[str, Any], *, include_removed: bool = False
+    ) -> dict[str, tuple[Any, Any]]:
         """Return the columns that differ between *old* and *new* as
         ``{col: (old_value, new_value)}``. Equal columns are omitted.
 
         Used by the renderer to show ``score: 0.5 → 0.95`` rather than
         every column on every updated row.
+
+        The default compares the source record's own keys only. In a partial
+        update, a target column omitted by this record remains untouched even
+        when another heterogeneous batch record caused it to be fetched.
+        Replace mode passes ``include_removed=True`` because it rebuilds the
+        whole row and an omitted target column resets to its destination
+        default.
         """
-        return {
-            col: (old.get(col), new.get(col))
-            for col in set(old) | set(new)
-            if old.get(col) != new.get(col)
-        }
+        changed = {col: (old.get(col), new[col]) for col in new if old.get(col) != new[col]}
+        if include_removed:
+            for col in old:
+                if col not in new:
+                    changed[col] = (old[col], RESET_TO_DESTINATION_DEFAULT)
+        return changed
+
+
+def _writes_full_row(config: DestinationConfig, sync_options: SyncOptions) -> bool:
+    """Whether a matched record is rebuilt from source fields alone.
+
+    Append-only writes intentionally do not qualify: they create a separate
+    physical row (or fail a uniqueness constraint), not reset an existing row.
+    """
+    del config
+    return sync_options.mode == "replace"
+
+
+def _is_append_only(config: DestinationConfig, sync_options: SyncOptions) -> bool:
+    """Whether this run physically appends records without matching target rows."""
+    if sync_options.mode == "replace":
+        return False
+    if isinstance(config, ClickHouseDestinationConfig):
+        return True
+    # Snowflake and Databricks force MERGE for sync.mode: mirror even when
+    # their destination config says mode: insert.
+    return sync_options.mode != "mirror" and getattr(config, "mode", None) == "insert"
 
 
 def _is_tracked_mirror(sync_options: SyncOptions) -> bool:
@@ -274,6 +338,59 @@ def _preview_tracked_mirror_deletes(
     )
 
 
+def _append_only_diff(
+    records: list[dict[str, Any]],
+    config: DestinationConfig,
+    sync_options: SyncOptions,
+    upsert_key: list[str] | None,
+    limit: int,
+) -> DiffResult:
+    """Preview append-only writes without comparing source keys to target rows.
+
+    ClickHouse always appends. Snowflake and Databricks append when their
+    destination ``mode`` is ``insert``. A duplicate key is still a new physical
+    write in each of those cases, not an in-place update. ClickHouse mirror
+    writes additionally need their independent DELETE preview, but that key
+    read must not turn the appended source rows into matches.
+    """
+    source_keys = (
+        {tuple(record.get(column) for column in upsert_key) for record in records}
+        if upsert_key
+        else set()
+    )
+    deleted: list[dict[str, Any]] = []
+    delete_reason: str | None = None
+    delete_preview_unavailable_reason: str | None = None
+
+    if sync_options.mode == "mirror":
+        assert upsert_key is not None
+        if _is_tracked_mirror(sync_options) and records:
+            deleted, delete_preview_unavailable_reason = _preview_tracked_mirror_deletes(
+                config, sync_options, upsert_key, source_keys, records
+            )
+            delete_reason = "mirror"
+        elif _is_destination_mirror(sync_options) and records:
+            deleted, delete_preview_unavailable_reason = _preview_destination_mirror_deletes(
+                config, sync_options, upsert_key, source_keys, records
+            )
+            delete_reason = "mirror_scan"
+        elif _is_diff_mirror(sync_options):
+            deleted = list(getattr(sync_options, "_diff_removed_keys", None) or [])
+            delete_reason = "mirror"
+
+    truncated = len(records) > limit or len(deleted) > limit
+    return DiffResult(
+        inserted=list(records[:limit]),
+        deleted=deleted[:limit],
+        total_source_rows=len(records),
+        total_destination_rows=None,
+        truncated=truncated,
+        supported=True,
+        delete_reason=delete_reason if deleted else None,
+        delete_preview_unavailable_reason=delete_preview_unavailable_reason,
+    )
+
+
 def compute_diff(
     records: list[dict[str, Any]],
     config: DestinationConfig,
@@ -286,9 +403,8 @@ def compute_diff(
         records: Source records about to be written.
         config: Destination configuration.
         sync_options: Sync options (used to read ``mode`` for delete semantics).
-        limit: Maximum number of records to include per category
-            (added / updated / deleted / sample). Truncation is reported
-            via :attr:`DiffResult.truncated`.
+        limit: Maximum number of records to include per category. Truncation
+            is reported via :attr:`DiffResult.truncated`.
 
     Returns:
         :class:`DiffResult` populated with either a true diff (queryable
@@ -310,6 +426,15 @@ def compute_diff(
 
     # Queryable → true diff
     upsert_key: list[str] | None = getattr(config, "upsert_key", None)
+    # An append-only destination never looks up a matching target row: the
+    # write creates a physical row even if the incoming key already exists.
+    # Mirror still requires an upsert key for its separate DELETE preview, so
+    # preserve the configuration fallback below when that key is absent.
+    if _is_append_only(config, sync_options) and (
+        sync_options.mode != "mirror" or upsert_key is not None
+    ):
+        return _append_only_diff(records, config, sync_options, upsert_key, limit)
+
     if not upsert_key:
         # Queryable but no upsert_key — can't key the diff. Treat as sample.
         sample = list(records[:limit])
@@ -352,16 +477,13 @@ def compute_diff(
     field_hint = sorted({*upsert_key, *(k for record in records for k in record)})
     try:
         if use_keyed_fetch:
-            # Explicit columns avoid metadata introspection on the keyed
-            # path. Deliberately records[0].keys(), not field_hint's
-            # cross-record union: the real write (BaseSqlDestination.load(),
-            # sql_base.py) derives each batch's column list the same way,
-            # from the first record only, so mirroring that here is what
-            # keeps the preview honest about what the real run will write —
-            # a union would fetch (and could report a phantom diff on)
-            # fields the real write silently drops on a heterogeneous
-            # batch. That drop is itself tracked separately (#1064 follow-up).
-            columns = list(records[0].keys())
+            # This is a read-only column projection, so fetch the batch-wide
+            # field union. The real write groups heterogeneous records by
+            # signature; ``changed_fields()`` below uses only the current
+            # record's keys for partial updates, avoiding the rejected
+            # union-based *comparison* that would report omitted fields as
+            # ``value → None``.
+            columns = field_hint
             try:
                 dest_rows = fetch_rows_by_keys(
                     config,
@@ -398,14 +520,19 @@ def compute_diff(
 
     added: list[dict[str, Any]] = []
     updated: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    replaced: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    writes_full_row = _writes_full_row(config, sync_options)
 
     for record in records:
         key = tuple(record.get(c) for c in upsert_key)
         existing = dest_by_key.get(key)
         if existing is None:
             added.append(record)
-        elif DiffResult.changed_fields(existing, record):
-            updated.append((existing, record))
+        elif DiffResult.changed_fields(existing, record, include_removed=writes_full_row):
+            if writes_full_row:
+                replaced.append((existing, record))
+            else:
+                updated.append((existing, record))
         # else: row matches destination exactly — no entry
 
     # Deleted is meaningful only when the engine would actually drop rows.
@@ -450,11 +577,14 @@ def compute_diff(
         deleted = list(getattr(sync_options, "_diff_removed_keys", None) or [])
         delete_reason = "mirror"
 
-    truncated = len(added) > limit or len(updated) > limit or len(deleted) > limit
+    truncated = (
+        len(added) > limit or len(updated) > limit or len(replaced) > limit or len(deleted) > limit
+    )
 
     return DiffResult(
         added=added[:limit],
         updated=updated[:limit],
+        replaced=replaced[:limit],
         deleted=deleted[:limit],
         total_source_rows=len(records),
         total_destination_rows=len(dest_rows),
@@ -464,4 +594,5 @@ def compute_diff(
         # delete set in replace mode is not a "replace deletion".
         delete_reason=delete_reason if deleted else None,
         delete_preview_unavailable_reason=delete_preview_unavailable_reason,
+        writes_full_row=writes_full_row,
     )

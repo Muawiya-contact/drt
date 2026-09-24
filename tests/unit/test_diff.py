@@ -27,7 +27,7 @@ from drt.config.models import (
     SyncOptions,
 )
 from drt.destinations._mirror_state import key_hash, key_json
-from drt.engine.diff import DiffResult, compute_diff
+from drt.engine.diff import RESET_TO_DESTINATION_DEFAULT, DiffResult, compute_diff
 
 
 def _has_psycopg2() -> bool:
@@ -140,8 +140,8 @@ class TestComputeDiffQueryable:
         assert result.total_destination_rows == 0
 
     @patch("drt.engine.diff.fetch_rows")
-    def test_updated_with_field_level_diff(self, mock_fetch: Any) -> None:
-        """Same key, different values — captured as updated with old + new."""
+    def test_replaced_with_field_level_diff(self, mock_fetch: Any) -> None:
+        """Same key, different values — replace mode rebuilds the row."""
         mock_fetch.return_value = [
             {"id": 1, "score": 0.5, "name": "Alice"},
             {"id": 2, "score": 0.9, "name": "Bob"},
@@ -153,12 +153,112 @@ class TestComputeDiffQueryable:
 
         result = compute_diff(records, _pg_config(), _options("replace"), limit=20)
 
-        assert len(result.updated) == 1
-        old, new = result.updated[0]
+        assert len(result.replaced) == 1
+        old, new = result.replaced[0]
         assert old["score"] == 0.5
         assert new["score"] == 0.95
         assert result.added == []
+        assert result.updated == []
         assert result.deleted == []
+
+    @patch("drt.engine.diff.fetch_rows_by_keys")
+    def test_partial_update_omitted_fields_are_unchanged(self, mock_fetch_keys: Any) -> None:
+        """Alternating sparse upserts preserve each record's omitted fields."""
+        mock_fetch_keys.return_value = [
+            {"id": 1, "score": 0.5, "note": "keep me"},
+            {"id": 2, "score": 0.8, "note": "flagged"},
+        ]
+
+        result = compute_diff(
+            [{"id": 1, "score": 0.5}, {"id": 2, "score": 0.8, "note": "flagged"}],
+            _pg_config(),
+            _options("full"),
+            limit=20,
+        )
+
+        assert result.added == []
+        assert result.updated == []
+        assert result.replaced == []
+        assert mock_fetch_keys.call_args.kwargs["columns"] == ["id", "note", "score"]
+        assert (
+            DiffResult.changed_fields(
+                {"id": 1, "score": 0.5, "note": "keep me"}, {"id": 1, "score": 0.5}
+            )
+            == {}
+        )
+
+    @patch("drt.engine.diff.fetch_rows")
+    def test_replace_omitted_fields_reset_to_destination_default(self, mock_fetch: Any) -> None:
+        """A replace rebuild surfaces an omitted target field as a reset."""
+        mock_fetch.return_value = [{"id": 1, "score": 0.5, "note": "old note"}]
+
+        result = compute_diff([{"id": 1, "score": 0.5}], _pg_config(), _options("replace"))
+
+        assert result.updated == []
+        assert len(result.replaced) == 1
+        old, new = result.replaced[0]
+        assert DiffResult.changed_fields(old, new, include_removed=True) == {
+            "note": ("old note", RESET_TO_DESTINATION_DEFAULT)
+        }
+        assert result.writes_full_row is True
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            _clickhouse_config(),
+            DatabricksDestinationConfig(
+                type="databricks",
+                host_env="DATABRICKS_HOST",
+                http_path_env="DATABRICKS_HTTP_PATH",
+                token_env="DATABRICKS_TOKEN",
+                catalog="main",
+                schema="analytics",
+                table="users",
+                mode="insert",
+                upsert_key=["id"],
+            ),
+        ],
+        ids=["clickhouse", "databricks-insert"],
+    )
+    @patch("drt.engine.diff.fetch_rows")
+    @patch("drt.engine.diff.fetch_rows_by_keys")
+    def test_append_only_duplicate_key_is_an_insert(
+        self, mock_fetch_keys: Any, mock_fetch: Any, config: Any
+    ) -> None:
+        """Append-only destinations do not compare a duplicate key as an update."""
+        records = [{"id": 1, "score": 0.95}]
+        mock_fetch_keys.return_value = [{"id": 1, "score": 0.5}]
+        mock_fetch.return_value = [{"id": 1, "score": 0.5}]
+
+        result = compute_diff(records, config, _options("full"), limit=20)
+
+        mock_fetch_keys.assert_not_called()
+        mock_fetch.assert_not_called()
+        assert result.inserted == records
+        assert result.added == []
+        assert result.updated == []
+        assert result.replaced == []
+        assert result.total_destination_rows is None
+
+    def test_merge_without_upsert_key_falls_back_to_sample(self) -> None:
+        """Only append mode can preview writes without a matching key."""
+        config = DatabricksDestinationConfig(
+            type="databricks",
+            host_env="DATABRICKS_HOST",
+            http_path_env="DATABRICKS_HTTP_PATH",
+            token_env="DATABRICKS_TOKEN",
+            catalog="main",
+            schema="analytics",
+            table="users",
+            mode="merge",
+        )
+
+        result = compute_diff([{"id": 1}], config, _options("full"), limit=20)
+
+        assert result.supported is False
+        assert result.sample == [{"id": 1}]
+        assert result.fallback_reason is not None
+        assert "upsert_key not configured" in result.fallback_reason
 
     @patch("drt.engine.diff.fetch_rows")
     def test_deleted_when_mode_is_replace(self, mock_fetch: Any) -> None:
@@ -174,7 +274,7 @@ class TestComputeDiffQueryable:
 
         assert len(result.deleted) == 1
         assert result.deleted[0]["id"] == 3
-        assert len(result.updated) == 1  # id=1 score changed
+        assert len(result.replaced) == 1  # id=1 score changed
         # The rows disappear because the table is rebuilt (#693, Task B2)
         assert result.delete_reason == "replace"
 
@@ -218,7 +318,7 @@ class TestComputeDiffQueryable:
 
         assert len(result.added) == 1
         assert result.added[0]["company_id"] == "c2"
-        assert len(result.updated) == 1
+        assert len(result.replaced) == 1
 
     @patch("drt.engine.diff.fetch_rows")
     def test_truncation_with_added_exceeding_limit(self, mock_fetch: Any) -> None:
@@ -309,7 +409,7 @@ class TestComputeDiffKeyedFetch:
 
         assert len(result.deleted) == 1
         assert result.deleted[0]["id"] == 3
-        assert len(result.updated) == 1
+        assert len(result.replaced) == 1
 
     def test_compute_diff_replace_mode_snowflake_uppercase_columns_end_to_end(
         self,
@@ -354,7 +454,7 @@ class TestComputeDiffKeyedFetch:
         assert len(result.deleted) == 1
         assert result.deleted[0]["id"] == 3
         assert result.added == []
-        assert len(result.updated) == 1
+        assert len(result.replaced) == 1
 
     def test_compute_diff_replace_mode_snowflake_uppercase_upsert_key_preserved(
         self,
@@ -394,7 +494,7 @@ class TestComputeDiffKeyedFetch:
         assert len(result.deleted) == 1
         assert result.deleted[0]["ID"] == 3
         assert result.added == []
-        assert len(result.updated) == 1
+        assert len(result.replaced) == 1
 
     def test_compute_diff_replace_mode_snowflake_reconciles_non_key_column_casing(
         self,
@@ -434,8 +534,8 @@ class TestComputeDiffKeyedFetch:
 
         assert result.deleted == []
         assert result.added == []
-        assert len(result.updated) == 1
-        old, new = result.updated[0]
+        assert len(result.replaced) == 1
+        old, new = result.replaced[0]
         assert new["id"] == 2
         assert result.changed_fields(old, new) == {"PlayerScore": (7, 99)}
 
@@ -477,7 +577,11 @@ class TestComputeDiffKeyedFetch:
 
         assert result.deleted == []
         assert result.added == []
-        assert result.updated == []
+        assert len(result.replaced) == 1
+        old, new = result.replaced[0]
+        assert DiffResult.changed_fields(old, new, include_removed=True) == {
+            "PlayerScore": (None, RESET_TO_DESTINATION_DEFAULT)
+        }
 
     def test_compute_diff_snowflake_field_hint_includes_upsert_key_even_if_first_record_omits_it(
         self,
@@ -960,6 +1064,8 @@ class TestComputeDiffMirrorDestination:
 
         # Only "2" (unseen by the source, in either type) previews as deleted.
         assert result.deleted == [{"id": "2"}]
+        assert result.inserted == records
+        mock_fetch_keys.assert_not_called()
 
     @patch("drt.engine.diff.fetch_all_keys")
     @patch("drt.engine.diff.fetch_rows_by_keys")
@@ -1323,6 +1429,25 @@ class TestComputeDiffMirrorDiffStrategy:
         assert result.deleted == []
         assert result.delete_reason is None
 
+    @patch("drt.engine.diff.fetch_rows_by_keys")
+    def test_clickhouse_diff_mirror_inserts_without_matching_target_rows(
+        self, mock_fetch_keys: Any
+    ) -> None:
+        """ClickHouse mirror appends source rows while diff strategy deletes separately."""
+        records = [{"id": "a"}]
+
+        result = compute_diff(
+            records,
+            _clickhouse_config(),
+            _mirror_diff_options([{"id": "stale"}]),
+            limit=20,
+        )
+
+        assert result.inserted == records
+        assert result.deleted == [{"id": "stale"}]
+        assert result.delete_reason == "mirror"
+        mock_fetch_keys.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # DiffResult helpers
@@ -1330,6 +1455,11 @@ class TestComputeDiffMirrorDiffStrategy:
 
 
 class TestDiffResult:
+    def test_reset_to_destination_default_sentinel_is_stable(self) -> None:
+        """The reset marker is comparable and hashable for diff consumers."""
+        assert RESET_TO_DESTINATION_DEFAULT == type(RESET_TO_DESTINATION_DEFAULT)()
+        assert hash(RESET_TO_DESTINATION_DEFAULT) == hash(type(RESET_TO_DESTINATION_DEFAULT)())
+
     def test_changed_fields_helper(self) -> None:
         """DiffResult.changed_fields returns dict of {col: (old, new)} per updated row."""
         old = {"id": 1, "score": 0.5, "name": "Alice"}
