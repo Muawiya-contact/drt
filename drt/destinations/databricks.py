@@ -49,6 +49,7 @@ Example sync YAML:
 from __future__ import annotations
 
 import json
+import re
 from datetime import timedelta
 from typing import Any
 
@@ -60,6 +61,45 @@ from drt.destinations.sql_base import BaseSqlDestination, _union_columns
 from drt.destinations.sql_utils import check_mirror_supported, tagged_cursor
 
 _SWAP_SUFFIX = "__drt_swap"
+
+
+def _value_expressions(
+    columns: list[str],
+    category_map: dict[str, str] | None,
+    ddls: dict[str, str] | None,
+) -> tuple[list[str], list[str]]:
+    """Return parameterised expressions and the JSON-backed columns.
+
+    Kept separate from :func:`_value_clause` because merge staging appends SQL
+    boolean literals to these expressions. Those literals deliberately do not
+    consume a native Databricks parameter marker.
+    """
+    exprs: list[str] = []
+    json_columns: list[str] = []
+    # information_schema reports column names lower-cased; source record keys may
+    # differ in case — fold both sides so wrapping fires for the common pipeline.
+    cats = (
+        {str(k).lower(): v for k, v in category_map.items()} if category_map is not None else None
+    )
+    ddl_map = {str(k).lower(): v for k, v in ddls.items()} if ddls is not None else None
+    for col in columns:
+        key = str(col).lower()
+        if cats is not None and cats.get(key) == "json":
+            json_columns.append(col)
+            ddl = ddl_map.get(key) if ddl_map is not None else None
+            if ddl:
+                # STRUCT / ARRAY / MAP — reconstruct via the target DDL.
+                # Escape single quotes so a pathological column DDL can't break
+                # out of the string literal (defence-in-depth — the DDL already
+                # comes verbatim from information_schema).
+                safe_ddl = ddl.replace("'", "''")
+                exprs.append(f"from_json(?, '{safe_ddl}')")
+            else:
+                # VARIANT — no DDL form.
+                exprs.append("parse_json(?)")
+        else:
+            exprs.append("?")
+    return exprs, json_columns
 
 
 def _value_clause(
@@ -87,31 +127,7 @@ def _value_clause(
     value itself stays a ``?`` bind. Returns ``(clause, json_columns)`` where
     ``clause`` already includes the ``VALUES (...)`` / ``SELECT ...`` keyword.
     """
-    exprs: list[str] = []
-    json_columns: list[str] = []
-    # information_schema reports column names lower-cased; source record keys may
-    # differ in case — fold both sides so wrapping fires for the common pipeline.
-    cats = (
-        {str(k).lower(): v for k, v in category_map.items()} if category_map is not None else None
-    )
-    ddl_map = {str(k).lower(): v for k, v in ddls.items()} if ddls is not None else None
-    for col in columns:
-        key = str(col).lower()
-        if cats is not None and cats.get(key) == "json":
-            json_columns.append(col)
-            ddl = ddl_map.get(key) if ddl_map is not None else None
-            if ddl:
-                # STRUCT / ARRAY / MAP — reconstruct via the target DDL.
-                # Escape single quotes so a pathological column DDL can't break
-                # out of the string literal (defence-in-depth — the DDL already
-                # comes verbatim from information_schema).
-                safe_ddl = ddl.replace("'", "''")
-                exprs.append(f"from_json(?, '{safe_ddl}')")
-            else:
-                # VARIANT — no DDL form.
-                exprs.append("parse_json(?)")
-        else:
-            exprs.append("?")
+    exprs, json_columns = _value_expressions(columns, category_map, ddls)
     if json_columns:
         return "SELECT " + ", ".join(exprs), json_columns
     return "VALUES (" + ", ".join(exprs) + ")", json_columns
@@ -128,9 +144,49 @@ def _bind_row(row: dict[str, Any], columns: list[str], json_columns: list[str]) 
 # markers per statement — multi-row INSERT chunks must stay under it (#734).
 _NATIVE_PARAM_LIMIT = 255
 
+_LITERAL_DEFAULT = re.compile(
+    r"(?:NULL|TRUE|FALSE|[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|'(?:''|[^'])*')",
+    re.IGNORECASE,
+)
+
+
+def _literal_default(default: Any) -> str | None:
+    """Return a safe SQL literal default, or ``None`` for NULL/non-literals."""
+    if default is None:
+        return None
+    value = str(default).strip()
+    return value if _LITERAL_DEFAULT.fullmatch(value) else None
+
+
+def _presence_flags(columns: list[str], target_columns: set[str]) -> dict[str, str]:
+    """Create collision-free presence-flag names for the staging relation.
+
+    Delta identifiers are case-insensitive.  A target can legitimately contain
+    a user-defined ``__drt_has_<column>`` column, so reserve all target and
+    payload names and suffix an internal flag until it is unique.
+    """
+    reserved = {column.lower() for column in target_columns}
+    reserved.update(column.lower() for column in columns)
+    flags: dict[str, str] = {}
+    for column in columns:
+        base = f"__drt_has_{column}"
+        candidate = base
+        suffix = 1
+        while candidate.lower() in reserved:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        flags[column] = candidate
+        reserved.add(candidate.lower())
+    return flags
+
 
 def _rows_per_chunk(n_cols: int) -> int:
     """How many rows fit in one multi-row INSERT under the native marker limit."""
+    if n_cols > _NATIVE_PARAM_LIMIT:
+        raise ValueError(
+            "Databricks supports at most "
+            f"{_NATIVE_PARAM_LIMIT} bound values per statement; received {n_cols}"
+        )
     return max(1, _NATIVE_PARAM_LIMIT // max(1, n_cols))
 
 
@@ -145,6 +201,107 @@ class DatabricksDestination(BaseSqlDestination):
 
         # Databricks-only STRUCT/ARRAY/MAP column -> full type DDL cache.
         self._ddl_cache: dict[str, dict[str, str] | None] = {}
+
+        # Target column name -> declared DEFAULT expression, cached for the
+        # destination instance.  MERGE needs this even when Layer 3 schema
+        # introspection is disabled: CTAS staging deliberately does not retain
+        # target DEFAULT metadata.
+        self._column_default_cache: dict[str, dict[str, Any]] = {}
+
+    def _target_column_defaults(
+        self, cur: Any, config: DatabricksDestinationConfig
+    ) -> dict[str, Any]:
+        """Read target columns and their declared defaults once for MERGE.
+
+        ``CREATE TABLE AS SELECT`` creates an empty Delta staging table but
+        strips target ``DEFAULT`` clauses.  We therefore read the metadata from
+        the target itself and use literal defaults in the final, single MERGE.
+        """
+        if config.table not in self._column_default_cache:
+            # INFORMATION_SCHEMA.COLUMNS.COLUMN_DEFAULT is permanently NULL
+            # on Databricks. DESCRIBE ... AS JSON is the documented,
+            # programmatic representation and carries each column's actual
+            # ``default`` field for both Unity Catalog and Hive Metastore.
+            table_fq = f"{config.catalog}.{config.schema_}.{config.table}"
+            cur.execute(f"DESCRIBE TABLE EXTENDED {table_fq} AS JSON")
+            rows = cur.fetchall()
+            raw_metadata = rows[0][0] if rows else None
+            if not isinstance(raw_metadata, str):
+                self._column_default_cache[config.table] = {}
+                return self._column_default_cache[config.table]
+            metadata = json.loads(raw_metadata)
+            self._column_default_cache[config.table] = {
+                str(column["name"]).lower(): column.get("default")
+                for column in metadata.get("columns", [])
+                if "name" in column
+            }
+        return self._column_default_cache[config.table]
+
+    def _insert_merge_staging_rows(
+        self,
+        cur: Any,
+        staging_table: str,
+        records: list[dict[str, Any]],
+        columns: list[str],
+        flags: dict[str, str],
+        category_map: dict[str, str] | None,
+        ddls: dict[str, str] | None,
+        sync_options: SyncOptions,
+        result: SyncResult,
+    ) -> None:
+        """Stage one heterogeneous batch without binding presence flags.
+
+        Every payload column remains a native ``?`` bind.  Per-row presence is
+        instead rendered as the SQL literals ``TRUE`` and ``FALSE``.  Thus a
+        200-column payload with 199 flags still binds 200 values, not 399, and
+        keeps every statement at or below Databricks' 255-marker ceiling.
+        """
+        rows_per = _rows_per_chunk(len(columns))
+        value_exprs, json_cols = _value_expressions(columns, category_map, ddls)
+        staging_columns = [*columns, *flags.values()]
+        prefix = f"INSERT INTO {staging_table} ({', '.join(staging_columns)})"
+
+        def flag_literals(row: dict[str, Any]) -> list[str]:
+            return ["TRUE" if column in row else "FALSE" for column in flags]
+
+        def record_error(index: int, row: dict[str, Any], exc: Exception) -> None:
+            record_row_error(result, index, str(row)[:200], exc)
+            if sync_options.on_error == "fail":
+                raise exc
+
+        if json_cols:
+            # from_json()/parse_json() require SELECT-form INSERTs.  This is
+            # already a one-row-at-a-time path; append flags as literals.
+            for index, row in enumerate(records):
+                sql = f"{prefix} SELECT {', '.join([*value_exprs, *flag_literals(row)])}"
+                try:
+                    cur.execute(sql, _bind_row(row, columns, json_cols))
+                except Exception as exc:
+                    record_error(index, row, exc)
+            return
+
+        # Scalar rows can still batch.  Each row marker has payload binds only;
+        # flags are SQL literals and therefore add no native markers.
+        for start in range(0, len(records), rows_per):
+            chunk = records[start : start + rows_per]
+            row_sql = [
+                "(" + ", ".join([*("?" for _ in columns), *flag_literals(row)]) + ")"
+                for row in chunk
+            ]
+            sql = f"{prefix} VALUES {', '.join(row_sql)}"
+            params = [value for row in chunk for value in _bind_row(row, columns, json_cols)]
+            try:
+                cur.execute(sql, params)
+            except Exception:
+                # A failed multi-row staging INSERT is atomic.  Replay it one
+                # record at a time to retain the project's exact RowError and
+                # on_error semantics.
+                for offset, row in enumerate(chunk):
+                    one_sql = f"{prefix} VALUES {row_sql[offset]}"
+                    try:
+                        cur.execute(one_sql, _bind_row(row, columns, json_cols))
+                    except Exception as exc:
+                        record_error(start + offset, row, exc)
 
     def _resolve_schema(self, config: DatabricksDestinationConfig) -> dict[str, str] | None:
         """Column -> type-category map for the target table, cached per sync.
@@ -362,55 +519,54 @@ class DatabricksDestination(BaseSqlDestination):
             if not config.upsert_key:
                 raise ValueError("upsert_key is required for merge mode")
 
-            # Deliberately NOT scoped per contiguous key-signature run
-            # (#1091) — unlike the ``insert`` branch above. Several rounds
-            # of Codex review on #1135 explored per-run staging/MERGE
-            # designs and each one traded one real bug for another: a
-            # shared final MERGE's blanket ``UPDATE SET`` clobbers a
-            # column a given row's run never sent; splitting into one
-            # MERGE per run breaks atomicity (each MERGE autocommits
-            # independently) and creates unbounded statement counts for
-            # alternating signatures; and per-column presence-flag CASE
-            # expressions fix the UPDATE side but can't fix the INSERT
-            # side, because ``CREATE OR REPLACE TABLE ... AS SELECT``
-            # doesn't carry over the target's DEFAULT clauses — a
-            # genuinely new row for a sparse run ends up with a staged
-            # ``NULL`` instead of the target's default, and a value
-            # expression has no way to say "apply this column's default"
-            # instead. Closing that gap needs either schema introspection
-            # of real DEFAULT values or accepting the per-run statement
-            # amplification #1091 already rejected elsewhere — deliberately
-            # left open and out of scope for #1091's fix. Tracked as a
-            # follow-up covering Databricks `mode: merge` /
-            # `sync.mode: mirror` (which forces this same branch)
-            # specifically.
-            col_list = ", ".join(columns)
-            value_clause, json_cols = _value_clause(columns, category_map, ddls)
-
             key_clause = " AND ".join([f"target.{k} = source.{k}" for k in config.upsert_key])
             update_cols = [c for c in columns if c not in config.upsert_key]
-            update_clause = ", ".join([f"{c} = source.{c}" for c in update_cols])
-            insert_cols = col_list
-            insert_vals = ", ".join([f"source.{c}" for c in columns])
+            target_defaults = self._target_column_defaults(cur, config)
+            # Reserve all payload names as well as every target name. A target
+            # may already have a legitimate user column called
+            # ``__drt_has_<column>``; use a deterministic suffix in that case
+            # instead of letting ALTER TABLE fail or overwrite user data.
+            flags = _presence_flags(update_cols, set(target_defaults) | set(columns))
 
+            # Delta has no multi-statement transaction. One shared staging
+            # relation and one final MERGE keep the target write atomic even
+            # when signatures alternate row-by-row; presence flags make that
+            # final MERGE preserve fields a particular source row omitted.
             staging_table = f"{config.catalog}.{config.schema_}.__drt_staging_{config.table}"
-
             cur.execute(
                 f"CREATE OR REPLACE TABLE {staging_table} AS SELECT * FROM {table_fq} WHERE 1=0"
             )
+            if flags:
+                flag_ddl = ", ".join(f"{flag} BOOLEAN" for flag in flags.values())
+                cur.execute(f"ALTER TABLE {staging_table} ADD COLUMNS ({flag_ddl})")
 
-            staging_sql = f"INSERT INTO {staging_table} ({col_list}) {value_clause}"
-            self._insert_rows(
+            self._insert_merge_staging_rows(
                 cur,
-                staging_sql,
+                staging_table,
                 records,
+                columns,
+                flags,
+                category_map,
+                ddls,
                 sync_options,
                 result,
-                columns,
-                json_cols,
-                count_success=False,
             )
 
+            update_clause = ", ".join(
+                f"{column} = CASE WHEN source.{flags[column]} "
+                f"THEN source.{column} ELSE target.{column} END"
+                for column in update_cols
+            )
+            insert_cols = ", ".join(columns)
+            insert_vals = ", ".join(
+                (
+                    f"CASE WHEN source.{flags[column]} THEN source.{column} "
+                    f"ELSE {_literal_default(target_defaults.get(column.lower())) or 'NULL'} END"
+                )
+                if column in flags
+                else f"source.{column}"
+                for column in columns
+            )
             matched_clause = f"WHEN MATCHED THEN UPDATE SET {update_clause}" if update_cols else ""
             merge_sql = (
                 f"MERGE INTO {table_fq} target "

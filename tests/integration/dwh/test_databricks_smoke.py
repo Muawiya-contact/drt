@@ -17,6 +17,9 @@ Covers the #672 verification set (BigQuery #673 / PR #700 is the reference shape
 - ``test_databricks_mirror_deletes_unobserved_keys`` — ``sync.mode: mirror``
   end-of-sync DELETE via the #707 staging anti-join removes the unobserved rows
   on a live warehouse (its parameter-limit immunity is covered by the unit suite).
+- ``test_databricks_merge_sparse_rows_preserve_defaults_and_updates`` — #1137's
+  one-MERGE presence flags preserve existing values for sparse updates and apply
+  a real Delta column default for sparse inserts.
 """
 
 from __future__ import annotations
@@ -440,6 +443,78 @@ def test_databricks_mirror_deletes_unobserved_keys(tmp_path: Path) -> None:
             with conn.cursor() as cur:
                 cur.execute(f"DROP TABLE IF EXISTS {fqn}")
                 cur.execute(f"DROP TABLE IF EXISTS {keys_fqn}")
+        finally:
+            conn.close()
+
+
+def test_databricks_merge_sparse_rows_preserve_defaults_and_updates() -> None:
+    """#1137: one heterogeneous MERGE preserves updates and Delta defaults.
+
+    The first record matches an existing row but omits ``note``; its current
+    value must survive. The second is a genuinely new sparse row and must get
+    the target's declared ``'pending'`` default rather than staging's NULL.
+    """
+    creds = require_env(
+        HOST_ENV,
+        HTTP_PATH_ENV,
+        TOKEN_ENV,
+        "DRT_SMOKE_DATABRICKS_CATALOG",
+        "DRT_SMOKE_DATABRICKS_SCHEMA",
+    )
+    catalog = creds["DRT_SMOKE_DATABRICKS_CATALOG"]
+    schema = creds["DRT_SMOKE_DATABRICKS_SCHEMA"]
+    table = unique_table("drt_smoke_sparse_merge")
+    fqn = f"`{catalog}`.`{schema}`.`{table}`"
+    staging_fqn = f"`{catalog}`.`{schema}`.`__drt_staging_{table}`"
+    config = DatabricksDestinationConfig(
+        type="databricks",
+        host_env=HOST_ENV,
+        http_path_env=HTTP_PATH_ENV,
+        token_env=TOKEN_ENV,
+        catalog=catalog,
+        schema=schema,
+        table=table,
+        mode="merge",
+        upsert_key=["id"],
+    )
+
+    conn = _connect(creds)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"CREATE TABLE {fqn} (id INT, score INT, note STRING DEFAULT 'pending') USING DELTA"
+            )
+            cur.execute(f"INSERT INTO {fqn} (id, score, note) VALUES (1, 1, 'keep')")
+    finally:
+        conn.close()
+
+    try:
+        result = DatabricksDestination().load(
+            [
+                {"id": 1, "score": 2},
+                {"id": 2, "score": 3},
+                {"id": 3, "note": "set"},
+            ],
+            config,
+            SyncOptions(mode="full"),
+        )
+        assert result.success == 3
+        assert result.failed == 0
+
+        conn = _connect(creds)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT id, score, note FROM {fqn} ORDER BY id")
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+        assert rows == [(1, 2, "keep"), (2, 3, "pending"), (3, None, "set")]
+    finally:
+        conn = _connect(creds)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {staging_fqn}")
+                cur.execute(f"DROP TABLE IF EXISTS {fqn}")
         finally:
             conn.close()
 
