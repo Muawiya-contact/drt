@@ -357,9 +357,10 @@ def _format_row_keys(row: dict[str, object], max_chars: int = 80) -> str:
 def print_diff_table(diff: object, sync_name: str) -> None:
     """Print a record-level diff produced by :func:`drt.engine.diff.compute_diff`.
 
-    For queryable destinations: renders added / updated (with field-level
-    changes) / deleted in colored sections. For non-queryable destinations:
-    renders the sample of records with a clear "no comparison available" note.
+    For queryable destinations: renders added / updated / replaced / inserted
+    (with field-level changes where applicable) / deleted in colored sections.
+    For non-queryable destinations: renders the sample of records with a clear
+    "no comparison available" note.
     """
     from drt.engine.diff import DiffResult
 
@@ -381,10 +382,16 @@ def print_diff_table(diff: object, sync_name: str) -> None:
 
     n_added = len(diff.added)
     n_updated = len(diff.updated)
+    n_replaced = len(diff.replaced)
+    n_inserted = len(diff.inserted)
     n_deleted = len(diff.deleted)
+    destination_rows = (
+        str(diff.total_destination_rows)
+        if diff.total_destination_rows is not None
+        else "not read (append-only)"
+    )
     console.print(
-        f"  [dim]source rows: {diff.total_source_rows} · "
-        f"destination rows: {diff.total_destination_rows}[/dim]"
+        f"  [dim]source rows: {diff.total_source_rows} · destination rows: {destination_rows}[/dim]"
     )
 
     # Added
@@ -408,6 +415,26 @@ def print_diff_table(diff: object, sync_name: str) -> None:
             console.print(f"    [yellow]~[/yellow] {key_repr} — {change_repr}")
     else:
         console.print("\n  [dim]~ Updated: none[/dim]")
+
+    # Replaced — replace mode rebuilds a matching row from the source record,
+    # including resets for target fields the record omits.
+    if n_replaced:
+        console.print(f"\n  [yellow]~ REPLACE (full row) ({n_replaced}):[/yellow]")
+        for old, new in diff.replaced:
+            changed = DiffResult.changed_fields(old, new, include_removed=True)
+            key_repr = next((f"{k}={v}" for k, v in new.items() if k in old), "(?)")
+            change_repr = ", ".join(
+                f"{column}: {old_value} → {new_value}"
+                for column, (old_value, new_value) in changed.items()
+            )
+            console.print(f"    [yellow]~[/yellow] {key_repr} — {change_repr}")
+
+    # Inserted — append-only writes create a new physical row. Do not reuse
+    # the upsert-oriented "Added" label: a duplicate key is still an INSERT.
+    if n_inserted:
+        console.print(f"\n  [green][+] INSERT (new row) ({n_inserted}):[/green]")
+        for row in diff.inserted:
+            console.print(f"    [green][+] INSERT (new row)[/green] {_format_row_keys(row)}")
 
     # Deleted — populated for replace mode (rows lost to the table rebuild) and
     # for both mirror strategies (rows removed by explicit DELETE statements).
@@ -438,7 +465,7 @@ def print_diff_table(diff: object, sync_name: str) -> None:
         reason = escape(diff.delete_preview_unavailable_reason)
         console.print("\n  [yellow]- Deleted (mirror DELETE): preview unavailable[/yellow]")
         console.print(f"    [dim]{reason}[/dim]")
-    elif diff.deleted == [] and any([n_added, n_updated]):
+    elif diff.deleted == [] and any([n_added, n_updated, n_replaced, n_inserted]):
         # Don't always print "Deleted: none" — only when other change types
         # are present, to avoid noise on full-upsert mode where deleted
         # never applies.
@@ -483,6 +510,17 @@ def diff_to_dict(diff: object) -> dict[str, object]:
             }
             for old, new in diff.updated
         ],
+        "replaced": [
+            {
+                "old": old,
+                "new": new,
+                "changed_fields": list(
+                    DiffResult.changed_fields(old, new, include_removed=True).keys()
+                ),
+            }
+            for old, new in diff.replaced
+        ],
+        "inserted": diff.inserted,
         "deleted": diff.deleted,
         # Why those rows go away: "replace" (table rebuild) | "mirror" (explicit
         # DELETEs, tracked state) | "mirror_scan" (explicit DELETEs, established

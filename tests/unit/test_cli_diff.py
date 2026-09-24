@@ -7,7 +7,7 @@ the CLI plumbing: flag validation, JSON-mode embedding, text-mode rendering.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -188,6 +188,52 @@ def _deleting_diff(delete_reason: str | None) -> Any:
         supported=True,
         delete_reason=delete_reason,
     )
+
+
+def test_print_diff_table_labels_append_only_rows_as_inserts() -> None:
+    """A duplicate append key is still shown as a new physical INSERT."""
+    from drt.cli.output import diff_to_dict
+    from drt.engine import diff as diff_mod
+
+    diff = diff_mod.DiffResult(
+        inserted=[{"id": 1, "score": 0.95}],
+        total_source_rows=1,
+        total_destination_rows=None,
+        supported=True,
+    )
+
+    out = _rendered(diff)
+    assert "[+] INSERT (new row) (1):" in out
+    assert "[+] INSERT (new row) id=1, score=0.95" in out
+    assert "destination rows: not read (append-only)" in out
+    assert "Updated (1)" not in out
+
+    payload = diff_to_dict(diff)
+    assert payload["inserted"] == [{"id": 1, "score": 0.95}]
+    assert payload["updated"] == []
+    assert payload["total_destination_rows"] is None
+
+
+def test_print_diff_table_labels_full_row_replacements() -> None:
+    """Replace previews render omitted fields as resets to a destination default."""
+    from drt.cli.output import diff_to_dict
+    from drt.engine import diff as diff_mod
+
+    diff = diff_mod.DiffResult(
+        replaced=[({"id": 1, "note": "old note"}, {"id": 1})],
+        total_source_rows=1,
+        total_destination_rows=1,
+        supported=True,
+        writes_full_row=True,
+    )
+
+    out = _rendered(diff)
+    assert "~ REPLACE (full row) (1):" in out
+    assert "note: old note → <default>" in out
+
+    payload = diff_to_dict(diff)
+    replaced = cast("list[dict[str, Any]]", payload["replaced"])
+    assert replaced[0]["changed_fields"] == ["note"]
 
 
 def test_print_diff_table_replace_delete_label_unchanged() -> None:
