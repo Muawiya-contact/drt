@@ -410,7 +410,19 @@ def compute_diff(
         :class:`DiffResult` populated with either a true diff (queryable
         destinations) or a sample of the source records (non-queryable).
     """
-    # Non-queryable → sample mode
+    upsert_key: list[str] | None = getattr(config, "upsert_key", None)
+    # An append-only destination never looks up a matching target row: the
+    # write creates a physical row even if the incoming key already exists.
+    # Mirror still requires an upsert key for its separate DELETE preview, so
+    # preserve the configuration fallback below when that key is absent.
+    if _is_append_only(config, sync_options) and (
+        sync_options.mode != "mirror" or upsert_key is not None
+    ):
+        return _append_only_diff(records, config, sync_options, upsert_key, limit)
+
+    # Non-queryable → sample mode. This deliberately comes after the
+    # append-only branch: BigQuery's streaming ``mode: insert`` does not
+    # implement target reads, but its write shape is still known exactly.
     if not is_queryable(config):
         sample = list(records[:limit])
         return DiffResult(
@@ -425,16 +437,6 @@ def compute_diff(
         )
 
     # Queryable → true diff
-    upsert_key: list[str] | None = getattr(config, "upsert_key", None)
-    # An append-only destination never looks up a matching target row: the
-    # write creates a physical row even if the incoming key already exists.
-    # Mirror still requires an upsert key for its separate DELETE preview, so
-    # preserve the configuration fallback below when that key is absent.
-    if _is_append_only(config, sync_options) and (
-        sync_options.mode != "mirror" or upsert_key is not None
-    ):
-        return _append_only_diff(records, config, sync_options, upsert_key, limit)
-
     if not upsert_key:
         # Queryable but no upsert_key — can't key the diff. Treat as sample.
         sample = list(records[:limit])

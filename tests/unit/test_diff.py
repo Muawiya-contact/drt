@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from drt.config.models import (
+    BigQueryDestinationConfig,
     ClickHouseDestinationConfig,
     DatabricksDestinationConfig,
     MySQLDestinationConfig,
@@ -239,6 +240,27 @@ class TestComputeDiffQueryable:
         assert result.updated == []
         assert result.replaced == []
         assert result.total_destination_rows is None
+
+    @patch("drt.engine.diff.is_queryable")
+    def test_nonqueryable_append_only_destination_is_an_insert(
+        self, mock_is_queryable: Any
+    ) -> None:
+        """BigQuery streaming inserts need no target-read capability to preview."""
+        mock_is_queryable.side_effect = AssertionError("append preview must not query the target")
+        config = BigQueryDestinationConfig(
+            type="bigquery",
+            project="project",
+            dataset="dataset",
+            table="users",
+            mode="insert",
+        )
+
+        result = compute_diff([{"id": 1}], config, _options("full"), limit=20)
+
+        assert result.supported
+        assert result.inserted == [{"id": 1}]
+        assert result.sample == []
+        mock_is_queryable.assert_not_called()
 
     def test_merge_without_upsert_key_falls_back_to_sample(self) -> None:
         """Only append mode can preview writes without a matching key."""
