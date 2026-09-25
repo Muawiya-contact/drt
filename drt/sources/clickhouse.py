@@ -42,7 +42,8 @@ class ClickHouseSource:
         ``DataError`` / ``IntegrityError`` / ``InternalError`` /
         ``NotSupportedError`` as siblings under ``DatabaseError``. Note
         ``StreamClosedError`` subclasses ``ProgrammingError``, so it is
-        correctly treated as permanent.
+        correctly treated as permanent. ``StreamFailureError`` subclasses
+        ``OperationalError``, so it is correctly retried.
 
         ClickHouse's HTTP interface means raw ``httpx`` exceptions can surface
         instead of a driver class. Those need no handling here — ``with_retry``
