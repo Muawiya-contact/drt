@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from drt.config.models import DatabricksDestinationConfig, SyncOptions
 from drt.destinations.databricks import DatabricksDestination, _bind_row, _value_clause
 
@@ -217,7 +219,7 @@ def test_merge_staging_path_wraps() -> None:
     assert "from_json(?, 'array<string>')" in staging
 
 
-def test_merge_json_staging_records_a_row_error() -> None:
+def test_merge_json_staging_records_a_row_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """A rejected JSON staging row respects the normal ``on_error`` contract."""
 
     class RejectingStagingCursor(_FakeCursor):
@@ -228,7 +230,7 @@ def test_merge_json_staging_records_a_row_error() -> None:
 
     dest = DatabricksDestination()
     cur = RejectingStagingCursor()
-    dest._connect = lambda c, **_kw: _FakeConn(cur)  # type: ignore[method-assign]
+    monkeypatch.setattr(dest, "_connect", lambda c, **_kw: _FakeConn(cur))
     dest._schema_cache = {"t": {"id": "scalar", "tags": "json"}}
     dest._ddl_cache = {"t": {"tags": "array<string>"}}
 
