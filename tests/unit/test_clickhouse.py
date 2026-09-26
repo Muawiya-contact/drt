@@ -122,7 +122,11 @@ class TestClickHouseSource:
 # ---------------------------------------------------------------------------
 
 
-def _install_fake_ch_exceptions(monkeypatch: pytest.MonkeyPatch) -> Any:
+def _install_fake_ch_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    stream_failure_error_is_operational: bool = False,
+) -> Any:
     """Provide ``clickhouse_connect.driver.exceptions`` for classification tests.
 
     clickhouse-connect is an optional extra and is not installed in the
@@ -131,7 +135,10 @@ def _install_fake_ch_exceptions(monkeypatch: pytest.MonkeyPatch) -> Any:
     root, Error below it, then InterfaceError and DatabaseError, with
     OperationalError / ProgrammingError / DataError / IntegrityError /
     InternalError / NotSupportedError as siblings under DatabaseError, and
-    StreamClosedError under ProgrammingError.
+    StreamClosedError under ProgrammingError. StreamFailureError inherits
+    Exception directly at the supported 1.6.0 floor; newer drivers re-parent
+    it under OperationalError, so the hierarchy guard below selects that
+    variant when checking its installed version.
     """
     import builtins
     import sys
@@ -166,10 +173,9 @@ def _install_fake_ch_exceptions(monkeypatch: pytest.MonkeyPatch) -> Any:
 
     # Added in #862 once the pin enumerated the real module instead of a
     # hand-kept list, which is exactly how their absence surfaced.
-    # StreamFailureError and StreamCompleteException descend from plain
-    # Exception rather than DatabaseError — worth mirroring precisely, since
-    # re-parenting either under OperationalError is what would silently start
-    # retrying a stream failure.
+    # StreamCompleteException remains a plain Exception. StreamFailureError is
+    # also direct at the supported floor; the hierarchy guard selects the
+    # newer OperationalError parent when required.
     class InternalError(DatabaseError):
         pass
 
@@ -179,7 +185,11 @@ def _install_fake_ch_exceptions(monkeypatch: pytest.MonkeyPatch) -> Any:
     class StreamCompleteException(Exception):
         pass
 
-    class StreamFailureError(Exception):
+    stream_failure_error_base = (
+        OperationalError if stream_failure_error_is_operational else Exception
+    )
+
+    class StreamFailureError(stream_failure_error_base):
         pass
 
     # The driver's Warning subclasses the *builtin* Warning as well as its own
@@ -427,7 +437,13 @@ def test_the_fake_exception_hierarchy_matches_the_real_driver(
     precisely so these suites are not silently skipped.
     """
     real = pytest.importorskip("clickhouse_connect.driver.exceptions")
-    fake = _install_fake_ch_exceptions(monkeypatch)
+    stream_failure_error_is_operational = hasattr(real, "StreamFailureError") and issubclass(
+        real.StreamFailureError, real.OperationalError
+    )
+    fake = _install_fake_ch_exceptions(
+        monkeypatch,
+        stream_failure_error_is_operational=stream_failure_error_is_operational,
+    )
 
     # Every exception class the real module defines, not a hand-kept list.
     real_names = sorted(
