@@ -82,6 +82,12 @@ class DiffResult:
 
     It stays ``None`` when nothing would be deleted.
 
+    ``destination_keys_scanned`` records the extra key-only read needed by a
+    destination-strategy mirror preview.  This is separate from
+    ``total_destination_rows``: append-only writes do not fetch matching target
+    rows, but their mirror delete preview can still scan target keys.  It remains
+    true when that scan finds no deletion candidates, so the cost is not hidden.
+
     ``delete_preview_unavailable_reason`` is set when a mirror delete read
     fails. This is deliberately separate from ``deleted=[]``: the latter means
     the read succeeded and found no rows to remove, while the former means the
@@ -105,7 +111,8 @@ class DiffResult:
 
     # Metadata
     total_source_rows: int = 0
-    # ``None`` means append-only rows did not need a destination read.
+    # ``None`` means append-only rows did not need a matching-row read.  Their
+    # mirror delete preview may still do a separate key-only scan below.
     total_destination_rows: int | None = 0
     truncated: bool = False
     supported: bool = True
@@ -117,6 +124,10 @@ class DiffResult:
     # A replace write rebuilds each existing row from its source record.
     # Omitted fields are therefore resets, unlike a partial update.
     writes_full_row: bool = False
+    # Kept last so existing positional ``DiffResult`` constructors retain their
+    # field ordering.  See the class docstring for why this can be true while
+    # ``total_destination_rows`` remains ``None``.
+    destination_keys_scanned: bool = False
 
     @staticmethod
     def changed_fields(
@@ -361,6 +372,7 @@ def _append_only_diff(
     deleted: list[dict[str, Any]] = []
     delete_reason: str | None = None
     delete_preview_unavailable_reason: str | None = None
+    destination_keys_scanned = False
 
     if sync_options.mode == "mirror":
         assert upsert_key is not None
@@ -370,6 +382,7 @@ def _append_only_diff(
             )
             delete_reason = "mirror"
         elif _is_destination_mirror(sync_options) and records:
+            destination_keys_scanned = True
             deleted, delete_preview_unavailable_reason = _preview_destination_mirror_deletes(
                 config, sync_options, upsert_key, source_keys, records
             )
@@ -384,6 +397,7 @@ def _append_only_diff(
         deleted=deleted[:limit],
         total_source_rows=len(records),
         total_destination_rows=None,
+        destination_keys_scanned=destination_keys_scanned,
         truncated=truncated,
         supported=True,
         delete_reason=delete_reason if deleted else None,
@@ -551,6 +565,7 @@ def compute_diff(
     deleted: list[dict[str, Any]] = []
     delete_reason: str | None = None
     delete_preview_unavailable_reason: str | None = None
+    destination_keys_scanned = False
     if sync_options.mode == "replace":
         deleted = [row for key, row in dest_by_key.items() if key not in source_keys]
         delete_reason = "replace"
@@ -565,6 +580,7 @@ def compute_diff(
         )
         delete_reason = "mirror"
     elif _is_destination_mirror(sync_options) and records:
+        destination_keys_scanned = True
         deleted, delete_preview_unavailable_reason = _preview_destination_mirror_deletes(
             config, sync_options, upsert_key, source_keys, records
         )
@@ -590,6 +606,7 @@ def compute_diff(
         deleted=deleted[:limit],
         total_source_rows=len(records),
         total_destination_rows=len(dest_rows),
+        destination_keys_scanned=destination_keys_scanned,
         truncated=truncated,
         supported=True,
         # Only claim a reason when there is something to explain — an empty

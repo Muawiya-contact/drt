@@ -1063,6 +1063,29 @@ class TestComputeDiffMirrorDestination:
 
     @patch("drt.engine.diff.fetch_all_keys")
     @patch("drt.engine.diff.fetch_rows_by_keys")
+    def test_append_only_mirror_reports_a_key_scan_when_it_finds_no_deletes(
+        self, mock_fetch_keys: Any, mock_all_keys: Any
+    ) -> None:
+        """ClickHouse append writes do not match rows, but mirror still scans keys.
+
+        A successful empty delete set must not be rendered as though no target
+        read happened: the scan is a real round trip and can be expensive.
+        """
+        mock_all_keys.return_value = [("a",)]
+        records = [{"id": "a"}]
+
+        result = compute_diff(
+            records, _clickhouse_config(), _mirror_destination_options(), limit=20
+        )
+
+        mock_fetch_keys.assert_not_called()
+        assert result.inserted == records
+        assert result.deleted == []
+        assert result.total_destination_rows is None
+        assert result.destination_keys_scanned is True
+
+    @patch("drt.engine.diff.fetch_all_keys")
+    @patch("drt.engine.diff.fetch_rows_by_keys")
     def test_clickhouse_dest_and_source_keys_compare_by_string_form(
         self, mock_fetch_keys: Any, mock_all_keys: Any
     ) -> None:

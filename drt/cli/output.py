@@ -385,14 +385,17 @@ def print_diff_table(diff: object, sync_name: str) -> None:
     n_replaced = len(diff.replaced)
     n_inserted = len(diff.inserted)
     n_deleted = len(diff.deleted)
-    destination_rows = (
-        str(diff.total_destination_rows)
-        if diff.total_destination_rows is not None
-        else "not read (append-only)"
-    )
-    console.print(
-        f"  [dim]source rows: {diff.total_source_rows} · destination rows: {destination_rows}[/dim]"
-    )
+    if diff.total_destination_rows is not None:
+        destination_summary = f"destination rows: {diff.total_destination_rows}"
+    elif diff.destination_keys_scanned:
+        destination_summary = (
+            "destination keys: scan unavailable (append-only mirror)"
+            if diff.delete_preview_unavailable_reason is not None
+            else "destination keys: scanned (append-only mirror)"
+        )
+    else:
+        destination_summary = "destination rows: not read (append-only)"
+    console.print(f"  [dim]source rows: {diff.total_source_rows} · {destination_summary}[/dim]")
 
     # Added
     if n_added:
@@ -501,6 +504,7 @@ def diff_to_dict(diff: object) -> dict[str, object]:
         "supported": True,
         "total_source_rows": diff.total_source_rows,
         "total_destination_rows": diff.total_destination_rows,
+        "destination_keys_scanned": diff.destination_keys_scanned,
         "added": diff.added,
         "updated": [
             {

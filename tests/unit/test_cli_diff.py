@@ -214,6 +214,45 @@ def test_print_diff_table_labels_append_only_rows_as_inserts() -> None:
     assert payload["total_destination_rows"] is None
 
 
+def test_append_only_mirror_reports_a_successful_destination_key_scan() -> None:
+    """An empty mirror delete set still comes from an expensive key scan."""
+    from drt.cli.output import diff_to_dict
+    from drt.engine import diff as diff_mod
+
+    diff = diff_mod.DiffResult(
+        inserted=[{"id": 1, "score": 0.95}],
+        total_source_rows=1,
+        total_destination_rows=None,
+        destination_keys_scanned=True,
+        supported=True,
+    )
+
+    out = _rendered(diff)
+
+    assert "destination keys: scanned (append-only mirror)" in out
+    assert "destination rows: not read (append-only)" not in out
+    assert diff_to_dict(diff)["destination_keys_scanned"] is True
+
+
+def test_append_only_mirror_reports_an_unavailable_destination_key_scan() -> None:
+    """A failed key scan is still distinct from a preview that skipped reading."""
+    from drt.engine import diff as diff_mod
+
+    diff = diff_mod.DiffResult(
+        inserted=[{"id": 1}],
+        total_source_rows=1,
+        total_destination_rows=None,
+        destination_keys_scanned=True,
+        delete_preview_unavailable_reason="PermissionError: SELECT denied",
+        supported=True,
+    )
+
+    out = _rendered(diff)
+
+    assert "destination keys: scan unavailable (append-only mirror)" in out
+    assert "destination rows: not read (append-only)" not in out
+
+
 def test_print_diff_table_labels_full_row_replacements() -> None:
     """Replace previews render omitted fields as resets to a destination default."""
     from drt.cli.output import diff_to_dict
