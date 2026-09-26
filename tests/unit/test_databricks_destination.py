@@ -7,6 +7,7 @@ Databricks workspace or databricks-sql-connector install required
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -318,50 +319,180 @@ class TestDatabricksDestinationLoad:
         # Staging table is dropped at the end so subsequent syncs don't trip
         assert any("DROP TABLE IF EXISTS main.default.__drt_staging_user_scores" in s for s in sqls)
 
-    def test_heterogeneous_merge_batch_is_a_known_open_gap(
+    def test_heterogeneous_merge_uses_literal_flags_and_target_defaults(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """#1091 fixed every SQL dialect's `records[0]`-only column
-        derivation except Databricks' `mode: merge` (also reached by
-        `sync.mode: mirror`) — several rounds of Codex review on #1135
-        found that closing it the way the other dialects were closed
-        (per-run-scoped staging/MERGE) trades one real bug for another
-        (MERGE autocommit atomicity, unbounded statement counts for
-        alternating signatures, or `CREATE TABLE ... AS SELECT` not
-        carrying over the target's `DEFAULT` clauses for a genuinely new
-        row). Left at the pre-#1091 baseline deliberately; tracked in
-        #1137. This test documents that the gap still exists, rather than
-        silently reappearing without anyone noticing: "note" — present
-        only on the second record — currently gets bound as an explicit
-        NULL for the first, clobbering its DEFAULT instead of leaving it
-        alone."""
+        """#1137 keeps an alternating sparse batch to one final MERGE.
+
+        Presence is rendered as SQL TRUE/FALSE rather than a bind marker. The
+        final INSERT applies the target's literal default only when that
+        particular source row omitted ``note``; the final UPDATE preserves an
+        existing value in the same situation.
+        """
         _set_creds(monkeypatch)
         conn = _fake_conn()
+        conn._cur.fetchall.return_value = [
+            (
+                json.dumps(
+                    {
+                        "columns": [
+                            {"name": "id"},
+                            {"name": "score"},
+                            {"name": "note", "default": "'pending'"},
+                        ]
+                    }
+                ),
+            )
+        ]
         modules = _mocked_databricks_modules(conn)
 
         records = [
             {"id": 1, "score": 0.95},
-            {"id": 2, "score": 0.80, "note": "flagged"},
+            {"id": 2, "note": "flagged"},
+            {"id": 3, "score": 0.80},
+            {"id": 4, "note": "review"},
         ]
         config = _config(mode="merge", upsert_key=["id"])
         with patch.dict("sys.modules", modules):
             result = DatabricksDestination().load(records, config, _options())
 
-        assert result.success == 2
+        assert result.success == 4
         sqls = [(call.args[0] if call.args else "") for call in conn._cur.execute.call_args_list]
+        assert any(
+            s.startswith("DESCRIBE TABLE EXTENDED main.default.user_scores AS JSON") for s in sqls
+        )
+        merge_calls = [s for s in sqls if s.startswith("MERGE INTO main.default.user_scores")]
+        assert len(merge_calls) == 1
+        merge_sql = merge_calls[0]
+        assert (
+            "score = CASE WHEN source.__drt_has_score THEN source.score ELSE target.score END"
+            in merge_sql
+        )
+        assert (
+            "note = CASE WHEN source.__drt_has_note THEN source.note ELSE target.note END"
+            in merge_sql
+        )
+        assert "CASE WHEN source.__drt_has_note THEN source.note ELSE 'pending' END" in merge_sql
+        assert "CASE WHEN source.__drt_has_score THEN source.score ELSE NULL END" in merge_sql
+
         staging_insert = next(
             s for s in sqls if s.startswith("INSERT INTO main.default.__drt_staging_user_scores")
         )
-        assert "note" in staging_insert
+        # Four rows * three actual payload columns. The two flags are SQL
+        # literals, so they do not add another eight native parameters.
+        assert staging_insert.count("?") == 12
+        assert staging_insert.count("TRUE") + staging_insert.count("FALSE") == 8
         params = next(
             call.args[1]
             for call in conn._cur.execute.call_args_list
             if call.args and call.args[0] == staging_insert
         )
-        # id=1's record never set "note" -- it still binds an explicit
-        # None (NULL) for it rather than omitting the column, the known
-        # #1137 gap this test pins down.
-        assert None in params
+        assert len(params) == 12
+
+    def test_merge_presence_flag_avoids_target_column_collision(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_creds(monkeypatch)
+        conn = _fake_conn()
+        # A user-defined target column can have the exact name of the first
+        # internal flag candidate. The flag is suffixed before ALTER TABLE.
+        conn._cur.fetchall.return_value = [
+            (
+                json.dumps(
+                    {
+                        "columns": [
+                            {"name": "id"},
+                            {"name": "note", "default": "'pending'"},
+                            {"name": "__drt_has_note"},
+                        ]
+                    }
+                ),
+            )
+        ]
+        modules = _mocked_databricks_modules(conn)
+
+        with patch.dict("sys.modules", modules):
+            DatabricksDestination().load(
+                [{"id": 1}, {"id": 2, "note": "set"}],
+                _config(mode="merge", upsert_key=["id"]),
+                _options(),
+            )
+
+        sqls = [(call.args[0] if call.args else "") for call in conn._cur.execute.call_args_list]
+        alter_sql = next(s for s in sqls if s.startswith("ALTER TABLE"))
+        assert "__drt_has_note_1 BOOLEAN" in alter_sql
+        merge_sql = next(s for s in sqls if s.startswith("MERGE INTO main.default.user_scores"))
+        assert "source.__drt_has_note_1" in merge_sql
+
+    def test_heterogeneous_merge_preserves_expression_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Sparse inserts must retain defaults such as ``current_timestamp()``."""
+        _set_creds(monkeypatch)
+        conn = _fake_conn()
+        conn._cur.fetchall.return_value = [
+            (
+                json.dumps(
+                    {
+                        "columns": [
+                            {"name": "id"},
+                            {"name": "created_at", "default": "current_timestamp()"},
+                        ]
+                    }
+                ),
+            )
+        ]
+        modules = _mocked_databricks_modules(conn)
+
+        with patch.dict("sys.modules", modules):
+            DatabricksDestination().load(
+                [{"id": 1}, {"id": 2, "created_at": "2026-09-24T00:00:00Z"}],
+                _config(mode="merge", upsert_key=["id"]),
+                _options(),
+            )
+
+        merge_sql = next(
+            call.args[0]
+            for call in conn._cur.execute.call_args_list
+            if call.args and call.args[0].startswith("MERGE INTO main.default.user_scores")
+        )
+        assert (
+            "CASE WHEN source.__drt_has_created_at THEN source.created_at "
+            "ELSE current_timestamp() END"
+        ) in merge_sql
+
+    def test_wide_merge_keeps_literal_flags_out_of_parameter_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_creds(monkeypatch)
+        conn = _fake_conn()
+        modules = _mocked_databricks_modules(conn)
+        wide_row = {"id": 1, **{f"value_{i}": i for i in range(199)}}
+
+        with patch.dict("sys.modules", modules):
+            DatabricksDestination().load(
+                [wide_row, {"id": 2}],
+                _config(mode="merge", upsert_key=["id"]),
+                _options(),
+            )
+
+        staging_inserts = [
+            call.args[0]
+            for call in conn._cur.execute.call_args_list
+            if call.args
+            and call.args[0].startswith("INSERT INTO main.default.__drt_staging_user_scores")
+        ]
+        # 200 data fields plus 199 flags: each row must be its own statement,
+        # but flags remain TRUE/FALSE literals, leaving exactly 200 markers.
+        assert len(staging_inserts) == 2
+        assert all(sql.count("?") == 200 for sql in staging_inserts)
+        assert all(sql.count("?") <= 255 for sql in staging_inserts)
+        assert any("TRUE" in sql and "FALSE" not in sql for sql in staging_inserts)
+        assert any("FALSE" in sql for sql in staging_inserts)
+
+    def test_empty_insert_record_is_rejected_before_generating_invalid_sql(self) -> None:
+        with pytest.raises(ValueError, match="no fields at all"):
+            DatabricksDestination().load([{}], _config(), _options())
 
     def test_merge_mode_requires_upsert_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _set_creds(monkeypatch)
@@ -1478,7 +1609,8 @@ class TestDatabricksChunkedInserts:
         assert _rows_per_chunk(1) == 255
         assert _rows_per_chunk(2) == 127
         assert _rows_per_chunk(255) == 1
-        assert _rows_per_chunk(300) == 1  # wider than the limit still progresses
+        with pytest.raises(ValueError, match="at most 255 bound values"):
+            _rows_per_chunk(300)
 
     def test_insert_chunks_at_native_param_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """200 two-column rows -> a 127-row chunk + a 73-row chunk."""
