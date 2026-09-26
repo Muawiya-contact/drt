@@ -166,9 +166,10 @@ def _install_fake_ch_exceptions(monkeypatch: pytest.MonkeyPatch) -> Any:
 
     # Added in #862 once the pin enumerated the real module instead of a
     # hand-kept list, which is exactly how their absence surfaced.
-    # StreamCompleteException descends from plain Exception, while
-    # StreamFailureError descends from OperationalError. Keep both exact: the
-    # latter must use the source retry path and the former must not.
+    # StreamFailureError and StreamCompleteException descend from plain
+    # Exception rather than DatabaseError — worth mirroring precisely, since
+    # re-parenting either under OperationalError is what would silently start
+    # retrying a stream failure.
     class InternalError(DatabaseError):
         pass
 
@@ -178,7 +179,7 @@ def _install_fake_ch_exceptions(monkeypatch: pytest.MonkeyPatch) -> Any:
     class StreamCompleteException(Exception):
         pass
 
-    class StreamFailureError(OperationalError):
+    class StreamFailureError(Exception):
         pass
 
     # The driver's Warning subclasses the *builtin* Warning as well as its own
@@ -218,9 +219,7 @@ def _install_fake_ch_exceptions(monkeypatch: pytest.MonkeyPatch) -> Any:
 
 
 class TestClickHouseTransientClassification:
-    @pytest.mark.parametrize(
-        "exc_name", ["OperationalError", "InterfaceError", "StreamFailureError"]
-    )
+    @pytest.mark.parametrize("exc_name", ["OperationalError", "InterfaceError"])
     def test_transient_errors(self, monkeypatch: pytest.MonkeyPatch, exc_name: str) -> None:
         mod = _install_fake_ch_exceptions(monkeypatch)
         assert ClickHouseSource()._is_transient(getattr(mod, exc_name)("disconnect")) is True
