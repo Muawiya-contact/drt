@@ -122,7 +122,11 @@ class TestClickHouseSource:
 # ---------------------------------------------------------------------------
 
 
-def _install_fake_ch_exceptions(monkeypatch: pytest.MonkeyPatch) -> Any:
+def _install_fake_ch_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    stream_failure_error_is_operational: bool = False,
+) -> Any:
     """Provide ``clickhouse_connect.driver.exceptions`` for classification tests.
 
     clickhouse-connect is an optional extra and is not installed in the
@@ -132,7 +136,9 @@ def _install_fake_ch_exceptions(monkeypatch: pytest.MonkeyPatch) -> Any:
     OperationalError / ProgrammingError / DataError / IntegrityError /
     InternalError / NotSupportedError as siblings under DatabaseError,
     StreamClosedError under ProgrammingError, and StreamFailureError under
-    OperationalError.
+    Exception directly at the supported 1.6.0 floor. Newer drivers re-parent
+    StreamFailureError under OperationalError; the hierarchy guard below
+    selects that variant when checking its installed version.
     """
     import builtins
     import sys
@@ -167,8 +173,9 @@ def _install_fake_ch_exceptions(monkeypatch: pytest.MonkeyPatch) -> Any:
 
     # Added in #862 once the pin enumerated the real module instead of a
     # hand-kept list, which is exactly how their absence surfaced.
-    # StreamCompleteException remains a plain Exception, while
-    # StreamFailureError inherits OperationalError and must remain retryable.
+    # StreamCompleteException remains a plain Exception. At the supported
+    # floor StreamFailureError does too, and it is explicitly retried because
+    # it occurs while opening a stream, before a row has been yielded.
     class InternalError(DatabaseError):
         pass
 
@@ -178,7 +185,11 @@ def _install_fake_ch_exceptions(monkeypatch: pytest.MonkeyPatch) -> Any:
     class StreamCompleteException(Exception):
         pass
 
-    class StreamFailureError(OperationalError):
+    stream_failure_error_base = (
+        OperationalError if stream_failure_error_is_operational else Exception
+    )
+
+    class StreamFailureError(stream_failure_error_base):
         pass
 
     # The driver's Warning subclasses the *builtin* Warning as well as its own
@@ -218,12 +229,17 @@ def _install_fake_ch_exceptions(monkeypatch: pytest.MonkeyPatch) -> Any:
 
 
 class TestClickHouseTransientClassification:
-    @pytest.mark.parametrize(
-        "exc_name", ["OperationalError", "InterfaceError", "StreamFailureError"]
-    )
+    @pytest.mark.parametrize("exc_name", ["OperationalError", "InterfaceError"])
     def test_transient_errors(self, monkeypatch: pytest.MonkeyPatch, exc_name: str) -> None:
         mod = _install_fake_ch_exceptions(monkeypatch)
         assert ClickHouseSource()._is_transient(getattr(mod, exc_name)("disconnect")) is True
+
+    def test_stream_failure_error_is_explicitly_transient(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """StreamFailureError is outside PEP 249 but occurs before yielding."""
+        mod = _install_fake_ch_exceptions(monkeypatch)
+        assert ClickHouseSource()._is_transient(mod.StreamFailureError("disconnect")) is True
 
     @pytest.mark.parametrize(
         "exc_name",
@@ -272,6 +288,28 @@ class TestClickHouseSourceRetry:
 
         assert rows == [{"id": 1}]
         assert len(attempts) == 3
+
+    def test_stream_failure_while_opening_is_retried_then_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Opening a stream is retryable because it cannot yield a partial row."""
+        mod = _install_fake_ch_exceptions(monkeypatch)
+        clients: list[MagicMock] = []
+
+        def connect(_config: Any) -> MagicMock:
+            client = _streaming_client([(1,)], columns=("id",))
+            if not clients:
+                client.query_rows_stream.side_effect = mod.StreamFailureError("disconnect")
+            clients.append(client)
+            return client
+
+        with patch.object(ClickHouseSource, "_connect", side_effect=connect):
+            with patch("drt.destinations.retry.time.sleep"):
+                rows = list(ClickHouseSource().extract("SELECT id FROM t", _config()))
+
+        assert rows == [{"id": 1}]
+        assert len(clients) == 2
+        clients[0].close.assert_called_once()
 
     def test_httpx_transport_error_is_retried_by_the_builtin_path(
         self, monkeypatch: pytest.MonkeyPatch
@@ -428,7 +466,13 @@ def test_the_fake_exception_hierarchy_matches_the_real_driver(
     precisely so these suites are not silently skipped.
     """
     real = pytest.importorskip("clickhouse_connect.driver.exceptions")
-    fake = _install_fake_ch_exceptions(monkeypatch)
+    stream_failure_error_is_operational = hasattr(real, "StreamFailureError") and issubclass(
+        real.StreamFailureError, real.OperationalError
+    )
+    fake = _install_fake_ch_exceptions(
+        monkeypatch,
+        stream_failure_error_is_operational=stream_failure_error_is_operational,
+    )
 
     # Every exception class the real module defines, not a hand-kept list.
     real_names = sorted(

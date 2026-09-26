@@ -43,7 +43,10 @@ class ClickHouseSource:
         ``NotSupportedError`` as siblings under ``DatabaseError``. Note
         ``StreamClosedError`` subclasses ``ProgrammingError``, so it is
         correctly treated as permanent. ``StreamFailureError`` subclasses
-        ``OperationalError``, so it is correctly retried.
+        ``Exception`` directly at the supported 1.6.0 floor (later versions
+        re-parent it under ``OperationalError``), but it is raised while
+        opening the stream — before any record is yielded — so it is
+        explicitly retried.
 
         ClickHouse's HTTP interface means raw ``httpx`` exceptions can surface
         instead of a driver class. Those need no handling here — ``with_retry``
@@ -54,7 +57,10 @@ class ClickHouseSource:
             from clickhouse_connect.driver import exceptions as ch_exc
         except ImportError:  # pragma: no cover - driver absent, nothing to classify
             return False
-        return isinstance(exc, (ch_exc.OperationalError, ch_exc.InterfaceError))
+        stream_failure_error = getattr(ch_exc, "StreamFailureError", None)
+        return isinstance(exc, (ch_exc.OperationalError, ch_exc.InterfaceError)) or (
+            stream_failure_error is not None and isinstance(exc, stream_failure_error)
+        )
 
     def extract(
         self,
