@@ -26,6 +26,20 @@ def _options(**kwargs: Any) -> SyncOptions:
     return SyncOptions(**kwargs)
 
 
+def _diff_options(removed_keys: list[dict[str, Any]] | None) -> SyncOptions:
+    opts = _options(
+        mode="mirror",
+        incremental_strategy="diff",
+        mirror={"strategy": "diff"},
+    )
+    opts._diff_removed_keys = removed_keys
+    opts._sync_name = "orders_sync"
+    return opts
+
+
+DIFF_KEYS_TBL = "main.default.__drt_mirror_keys_user_scores_diff_orders_sync_498a38c7"
+
+
 def _config(**overrides: Any) -> DatabricksDestinationConfig:
     defaults: dict[str, Any] = {
         "type": "databricks",
@@ -789,6 +803,113 @@ class TestDatabricksMirrorMode:
         ]
         assert key_inserts == [["a", 1]]  # the composite key staged as a tuple
 
+    def test_diff_mirror_finalize_deletes_exact_removed_keys(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A removal-only diff run still stages and deletes its exact key list."""
+        _set_creds(monkeypatch)
+        conn = _fake_conn()
+        modules = _mocked_databricks_modules(conn)
+        config = _config(mode="merge", upsert_key=["id"])
+
+        with patch.dict("sys.modules", modules):
+            result = DatabricksDestination().finalize_sync(
+                config, _diff_options([{"id": 2}, {"id": 4}])
+            )
+
+        assert result is not None
+        calls = conn._cur.execute.call_args_list
+        keys_tbl = DIFF_KEYS_TBL
+        key_insert = next(
+            call
+            for call in calls
+            if call.args and call.args[0].startswith(f"INSERT INTO {keys_tbl}")
+        )
+        assert key_insert.args[1] == [2, 4]
+        delete_call = next(
+            call for call in calls if call.args and call.args[0].startswith("DELETE FROM")
+        )
+        assert delete_call.args == (
+            f"DELETE FROM main.default.user_scores WHERE id IN (SELECT id FROM {keys_tbl})",
+        )
+
+    def test_diff_mirror_finalize_composite_key_uses_matched_delete_merge(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Delta composite keys avoid its unsupported tuple-IN predicate (#908)."""
+        _set_creds(monkeypatch)
+        conn = _fake_conn()
+        modules = _mocked_databricks_modules(conn)
+        config = _config(mode="merge", upsert_key=["tenant_id", "user_id"])
+        opts = _diff_options(
+            [
+                {"tenant_id": "a", "user_id": 1},
+                {"tenant_id": "b", "user_id": 2},
+            ]
+        )
+
+        with patch.dict("sys.modules", modules):
+            DatabricksDestination().finalize_sync(config, opts)
+
+        calls = conn._cur.execute.call_args_list
+        keys_tbl = DIFF_KEYS_TBL
+        key_insert = next(
+            call
+            for call in calls
+            if call.args and call.args[0].startswith(f"INSERT INTO {keys_tbl}")
+        )
+        assert key_insert.args[1] == ["a", 1, "b", 2]
+        delete_merge = next(
+            call
+            for call in calls
+            if call.args and call.args[0].startswith("MERGE INTO") and "THEN DELETE" in call.args[0]
+        )
+        assert delete_merge.args == (
+            f"MERGE INTO main.default.user_scores AS t USING {keys_tbl} AS s "
+            "ON t.tenant_id = s.tenant_id AND t.user_id = s.user_id "
+            "WHEN MATCHED THEN DELETE",
+        )
+
+    def test_diff_mirror_staging_table_is_isolated_per_sync(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Concurrent diff syncs on one table must not share a staging table."""
+        _set_creds(monkeypatch)
+        config = _config(mode="merge", upsert_key=["id"])
+        staging: list[str] = []
+        for sync_name in ("orders_sync", "orders.v2", "orders_sync"):
+            conn = _fake_conn()
+            opts = _diff_options([{"id": 1}])
+            opts._sync_name = sync_name
+            with patch.dict("sys.modules", _mocked_databricks_modules(conn)):
+                DatabricksDestination().finalize_sync(config, opts)
+            create = next(
+                c.args[0]
+                for c in conn._cur.execute.call_args_list
+                if c.args and c.args[0].startswith("CREATE OR REPLACE TABLE")
+            )
+            staging.append(create.split()[4])
+
+        assert staging[0] == DIFF_KEYS_TBL
+        assert staging[0] != staging[1]
+        assert staging[0] == staging[2]  # stable per sync, so crash leftovers self-heal
+        assert "orders_v2_15ab348b" in staging[1]
+
+    def test_diff_mirror_finalize_skips_empty_removed_list(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_creds(monkeypatch)
+        conn = _fake_conn()
+        modules = _mocked_databricks_modules(conn)
+
+        with patch.dict("sys.modules", modules):
+            result = DatabricksDestination().finalize_sync(
+                _config(mode="merge", upsert_key=["id"]), _diff_options([])
+            )
+
+        assert result is None
+        conn.cursor.assert_not_called()
+
     def test_mirror_skips_failed_keys_from_delete_observed_set(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1099,6 +1220,20 @@ def test_tracked_mirror_strategy_accepted_on_databricks(
 
     with patch.dict("sys.modules", _mocked_databricks_modules(conn)):
         result = dest.load([{"id": 1, "score": 100}], config, opts)
+
+    assert result.failed == 0
+
+
+def test_diff_mirror_strategy_accepted_on_databricks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Databricks opts into diff mirror once its exact-key finalizer exists."""
+    _set_creds(monkeypatch)
+    conn = _fake_conn()
+    config = _config(upsert_key=["id"])
+
+    with patch.dict("sys.modules", _mocked_databricks_modules(conn)):
+        result = DatabricksDestination().load([{"id": 1, "score": 100}], config, _diff_options([]))
 
     assert result.failed == 0
 
