@@ -9,6 +9,7 @@ destination:
   ref: main
   inputs_template: |
     {
+      "deployment_id": "{{ row.id }}",
       "environment": "{{ row.env }}",
       "version":     "{{ row.version }}",
       "triggered_by": "drt"
@@ -17,7 +18,8 @@ destination:
     type: bearer
     token_env: GITHUB_TOKEN
 sync:
-  mode: full
+  mode: incremental
+  cursor_field: approved_at
   batch_size: 1         # 1デプロイずつトリガー
   rate_limit:
     requests_per_second: 2
