@@ -12,10 +12,18 @@ result, drt has no failure to retry:
 - the [Dead Letter Queue](dead-letter-queue.md) stores known delivery failures;
 - neither one detects work that was accepted but never completed.
 
+Rows can also go missing before a destination accepts them. For example, an
+operator might deliberately skip a row error, data might arrive behind the
+current watermark, or an existing row might become eligible after a filter or
+allowlist changes. These misses do not necessarily produce a stored failure
+either.
+
 A **reconciliation sync**, also called a sweep, closes that gap. Run a second
 `mode: full` sync on a slower schedule. Its model compares the rows that
 should have landed with evidence of what actually landed, then selects only
-the missing rows for another attempt.
+the missing rows for another attempt. The comparison recovers a missing row
+regardless of whether the original cause was a skipped error, late data, a
+classification change, or downstream work that never finished.
 
 ## The pattern
 
@@ -24,7 +32,7 @@ The model is an anti-join between the expected and completed sets:
 ```sql
 SELECT
     expected.id,
-    expected.environment,
+    expected.env,
     expected.version
 FROM `your_project.operations.approved_deployments` AS expected
 LEFT JOIN `your_project.operations.completed_deployments` AS completed
