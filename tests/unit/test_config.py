@@ -2086,6 +2086,25 @@ class TestRateLimitKey:
         assert region_a.rate_limit_key() == region_b.rate_limit_key()
         assert region_a.model_dump(by_alias=True)["rate_limit_key"] == "vendor-account-a"
 
+    def test_staged_upload_rate_limit_key_survives_model_dump_round_trip(self) -> None:
+        """The internal field name emitted by a normal model dump must remain
+        valid input; otherwise serialization silently discards the override."""
+        from drt.config.destinations_saas import StagedUploadDestinationConfig
+
+        config = StagedUploadDestinationConfig.model_validate(
+            {
+                "type": "staged_upload",
+                "stage": {"url": "https://storage.example.com/upload"},
+                "trigger": {"url": "https://api.vendor.com/jobs"},
+                "rate_limit_key": "vendor-account-a",
+            }
+        )
+
+        reparsed = StagedUploadDestinationConfig.model_validate(config.model_dump())
+
+        assert reparsed.rate_limit_key_override == "vendor-account-a"
+        assert reparsed.rate_limit_key() == "staged_upload:vendor-account-a"
+
     @pytest.mark.parametrize("value", ["", "   "])
     def test_staged_upload_rate_limit_key_rejects_empty_override(self, value: str) -> None:
         """An explicitly empty identity must not silently become a shared

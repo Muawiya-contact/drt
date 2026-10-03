@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from drt.config.base import (
     LITERAL_CREDENTIAL_KEY,
@@ -1013,6 +1013,8 @@ class StagedUploadPollConfig(BaseModel):
 
 
 class StagedUploadDestinationConfig(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     type: Literal["staged_upload"]
     stage: StagedUploadPhaseConfig
     trigger: StagedUploadPhaseConfig
