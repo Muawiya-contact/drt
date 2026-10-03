@@ -8,7 +8,7 @@ Ready-to-run drt configurations. Each directory is a self-contained project.
 | [duckdb_to_slack](./duckdb_to_slack/) | DuckDB | Slack | Requires `SLACK_WEBHOOK_URL` |
 | [notify_slack](./notify_slack/) | DuckDB | Slack | Alert-style notification pattern |
 | [bigquery_to_hubspot](./bigquery_to_hubspot/) | BigQuery | HubSpot | Requires GCP + HubSpot credentials |
-| [bigquery_to_github_actions](./bigquery_to_github_actions/) | BigQuery | GitHub Actions | Trigger workflows from query results |
+| [bigquery_to_github_actions](./bigquery_to_github_actions/) | BigQuery | GitHub Actions | Incremental dispatch with a reconciliation sweep |
 | [duckdb_to_google_sheets](./duckdb_to_google_sheets/) | DuckDB | Google Sheets | Requires GCP service account |
 | [sqlite_to_google_sheets](./sqlite_to_google_sheets/) | SQLite | Google Sheets | Requires GCP service account |
 | [postgres_to_slack](./postgres_to_slack/) | PostgreSQL | Slack | Incremental sync, requires `SLACK_WEBHOOK_URL` |
