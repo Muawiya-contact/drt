@@ -2105,6 +2105,22 @@ class TestRateLimitKey:
         assert reparsed.rate_limit_key_override == "vendor-account-a"
         assert reparsed.rate_limit_key() == "staged_upload:vendor-account-a"
 
+    def test_staged_upload_null_rate_limit_key_uses_host_fallback(self) -> None:
+        """An explicit YAML null is equivalent to omitting the override."""
+        from drt.config.destinations_saas import StagedUploadDestinationConfig
+
+        config = StagedUploadDestinationConfig.model_validate(
+            {
+                "type": "staged_upload",
+                "stage": {"url": "https://storage.example.com/upload"},
+                "trigger": {"url": "https://api.vendor.com/jobs"},
+                "rate_limit_key": None,
+            }
+        )
+
+        assert config.rate_limit_key_override is None
+        assert config.rate_limit_key() == "staged_upload:api.vendor.com"
+
     @pytest.mark.parametrize("value", ["", "   "])
     def test_staged_upload_rate_limit_key_rejects_empty_override(self, value: str) -> None:
         """An explicitly empty identity must not silently become a shared
