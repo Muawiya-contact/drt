@@ -1028,6 +1028,17 @@ class StagedUploadDestinationConfig(BaseModel):
         min_length=1,
     )
 
+    @field_validator("rate_limit_key_override")
+    @classmethod
+    def strip_rate_limit_key_override(cls, value: str | None) -> str | None:
+        """Normalize the operator-provided quota identity."""
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("rate_limit_key must not be blank")
+        return stripped
+
     def describe(self) -> str:
         return "staged_upload"
 

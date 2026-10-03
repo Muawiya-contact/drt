@@ -2086,7 +2086,8 @@ class TestRateLimitKey:
         assert region_a.rate_limit_key() == region_b.rate_limit_key()
         assert region_a.model_dump(by_alias=True)["rate_limit_key"] == "vendor-account-a"
 
-    def test_staged_upload_rate_limit_key_rejects_empty_override(self) -> None:
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_staged_upload_rate_limit_key_rejects_empty_override(self, value: str) -> None:
         """An explicitly empty identity must not silently become a shared
         catch-all bucket or fall back to host inference."""
         from drt.config.destinations_saas import StagedUploadDestinationConfig
@@ -2097,7 +2098,7 @@ class TestRateLimitKey:
                     "type": "staged_upload",
                     "stage": {"url": "https://storage.example.com/upload"},
                     "trigger": {"url": "https://api.vendor.com/jobs"},
-                    "rate_limit_key": "",
+                    "rate_limit_key": value,
                 }
             )
 
