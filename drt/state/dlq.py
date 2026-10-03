@@ -23,7 +23,7 @@ import hashlib
 import json
 import threading
 import uuid
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,20 +63,29 @@ class DeadLetter:
     # serialized. It must NOT fire when *decoding* a legacy JSONL line that
     # predates this field: `replay_dead_letters()` reads the queue multiple
     # times per invocation (once to decide what to retry, then again inside
-    # each per-chunk `reconcile()` call to compute that chunk's write, #1127),
+    # `reconcile()` to compute the write against fresh state, #1127),
     # and independent `DeadLetter(**json.loads(line))` calls on the *same
     # unchanged line* would each trigger this factory fresh — producing a
     # different random id per read for one entry, so every legacy entry's
     # remove/update would silently never match (caught in review, #955).
-    # `decode_dead_letter_line()` below is the actual JSONL entry point and
+    # `decode_dead_letter_line()` below is the single-line JSONL primitive and
     # handles that case with a content hash instead — deterministic for the
-    # same bytes, so repeated reads of the same untouched line agree.
-    # Bypassing that function and constructing
-    # directly from a legacy dict (as tests occasionally do to simulate a
-    # pre-#955 file) is the only path that still exercises this default on
-    # already-persisted data — a reminder to route JSONL reads through the
-    # decoder, not this constructor default.
+    # same bytes, so repeated reads of the same untouched line agree. Its
+    # sequence counterpart additionally disambiguates repeated hashes by
+    # occurrence. Bypassing those decoders and constructing directly from a
+    # legacy dict (as tests occasionally do to simulate a pre-#955 file) is
+    # the only path that still exercises this default on already-persisted
+    # data — a reminder to route JSONL reads through the decoders, not this
+    # constructor default.
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
+
+
+def _decode_dead_letter_line_with_origin(raw_line: str) -> tuple[DeadLetter, bool]:
+    data = json.loads(raw_line)
+    legacy = "id" not in data
+    if legacy:
+        data["id"] = hashlib.sha256(raw_line.strip().encode()).hexdigest()
+    return DeadLetter(**data), legacy
 
 
 def decode_dead_letter_line(raw_line: str) -> DeadLetter:
@@ -85,15 +94,84 @@ def decode_dead_letter_line(raw_line: str) -> DeadLetter:
     Entries written before ``id`` existed get a deterministic id — the
     SHA-256 of the literal line content — rather than the dataclass
     default's random one, so repeated reads of the same unchanged line
-    (``replay_dead_letters()`` reads the queue multiple times per
-    invocation, once per per-chunk ``reconcile()`` call — #1127) agree
+    (``replay_dead_letters()`` reads the queue once to select work and again
+    during fresh-state ``reconcile()`` — #1127) agree
     on identity instead of producing entries ``reconcile()`` can never
-    match (#955).
+    match (#955). File readers use :func:`decode_dead_letter_lines` to add
+    occurrence ordinals when multiple legacy lines have the same hash.
     """
-    data = json.loads(raw_line)
-    if "id" not in data:
-        data["id"] = hashlib.sha256(raw_line.strip().encode()).hexdigest()
-    return DeadLetter(**data)
+    entry, _ = _decode_dead_letter_line_with_origin(raw_line)
+    return entry
+
+
+def _decode_unique(lines: Iterable[str]) -> list[tuple[str, DeadLetter | None]]:
+    """Pair each non-blank raw line with its decoded entry (``None`` if undecodable).
+
+    Ids are made unique in file order: the first holder of an id keeps it and
+    later holders get ``<id>-<n>`` (first free ``n``). This covers both
+    byte-identical pre-#955 lines (same content hash) and twins whose shared
+    hash an older writer already persisted as an explicit ``id``.
+    """
+    decoded: list[tuple[str, DeadLetter | None]] = []
+    for raw_line in lines:
+        if not raw_line.strip():
+            continue
+        try:
+            entry, _ = _decode_dead_letter_line_with_origin(raw_line)
+            if not isinstance(entry.id, str):
+                raise TypeError("id must be a string")
+        except (json.JSONDecodeError, TypeError):
+            # A single malformed line should not abort an entire retry.
+            decoded.append((raw_line, None))
+            continue
+        decoded.append((raw_line, entry))
+
+    # Reserve every persisted id first so a generated suffix can never steal
+    # a unique explicit id that appears later in the file.
+    reserved = {entry.id for _, entry in decoded if entry is not None}
+    assigned: set[str] = set()
+    next_suffix: dict[str, int] = {}
+    for _, item in decoded:
+        if item is None:
+            continue
+        if item.id in assigned:
+            base = item.id
+            n = next_suffix.get(base, 1)
+            while f"{base}-{n}" in reserved or f"{base}-{n}" in assigned:
+                n += 1
+            next_suffix[base] = n + 1
+            item.id = f"{base}-{n}"
+        assigned.add(item.id)
+    return decoded
+
+
+def decode_dead_letter_lines(lines: Iterable[str]) -> list[DeadLetter]:
+    """Parse a DLQ JSONL sequence into entries with unique ids (#1147).
+
+    A pre-#955 line has no durable ``id``, so its single-line fallback is a
+    content hash and byte-identical lines would collide, making id-keyed
+    ``reconcile()`` hit every twin. Ids are therefore de-duplicated in file
+    order (see :func:`_decode_unique`); the first occurrence keeps its
+    historical hash and unique explicit ids are never changed.
+
+    Deterministic for an unchanged file, as retry's re-read during
+    reconciliation requires (#1127). Writers that evict entries must persist
+    the derived ids first (see :func:`materialize_dead_letter_lines`), or the
+    survivors would be renumbered on the next read.
+    """
+    return [entry for _, entry in _decode_unique(lines) if entry is not None]
+
+
+def materialize_dead_letter_lines(lines: Iterable[str]) -> list[str]:
+    """Return ``lines`` with decodable entries rewritten to carry their unique id.
+
+    Undecodable lines are kept verbatim so a rewrite never destroys
+    repairable data.
+    """
+    return [
+        raw_line if entry is None else json.dumps(asdict(entry))
+        for raw_line, entry in _decode_unique(lines)
+    ]
 
 
 @runtime_checkable
@@ -197,7 +275,10 @@ class LocalDlqStore:
         with advisory_lock(path):
             with self._lock:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                lines = self._read_raw(path)
+                # Persist unique ids (#1147) before the FIFO cap can evict an
+                # earlier twin; otherwise the survivor is renumbered on the
+                # next read and a concurrent retry's confirmed id hits it.
+                lines = materialize_dead_letter_lines(self._read_raw(path))
                 lines.extend(json.dumps(asdict(e)) for e in entries)
                 if max_records > 0 and len(lines) > max_records:
                     lines = lines[-max_records:]
@@ -237,14 +318,7 @@ class LocalDlqStore:
     # -- reads --------------------------------------------------------------
 
     def _read_entries(self, sync_name: str) -> list[DeadLetter]:
-        out: list[DeadLetter] = []
-        for line in self._read_raw(self._path(sync_name)):
-            try:
-                out.append(decode_dead_letter_line(line))
-            except (json.JSONDecodeError, TypeError):
-                # A single malformed line should not abort an entire retry.
-                continue
-        return out
+        return decode_dead_letter_lines(self._read_raw(self._path(sync_name)))
 
     def read(self, sync_name: str) -> list[DeadLetter]:
         """Return every dead-letter entry for ``sync_name`` (corrupt lines skipped)."""
