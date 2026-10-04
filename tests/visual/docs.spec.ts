@@ -80,3 +80,8 @@ test("sync definition @mobile", async ({ page }) => {
   await openDocsPage(page, "/sync/orders-to-pg.html");
   await expectStableScreenshot(page, "sync-definition.png", false);
 });
+
+test("overview page @dark", async ({ page }) => {
+  await openDocsPage(page, "/index.html");
+  await expectStableScreenshot(page, "overview.png");
+});

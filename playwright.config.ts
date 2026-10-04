@@ -48,5 +48,14 @@ export default defineConfig({
         isMobile: true,
       },
     },
+    {
+      name: "chromium-dark",
+      grep: /@dark/,
+      use: {
+        colorScheme: "dark",
+        viewport: { width: 1440, height: 1000 },
+        deviceScaleFactor: 1,
+      },
+    },
   ],
 });
