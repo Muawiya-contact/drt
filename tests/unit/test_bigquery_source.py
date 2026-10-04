@@ -233,7 +233,7 @@ class TestManagedTableCapable:
 
         BigQuerySource().drop_managed_table(_config(), "_drt_runs")
 
-        client.delete_table.assert_called_once_with("my-proj._drt._drt_runs")
+        client.delete_table.assert_called_once_with("my-proj._drt._drt_runs", not_found_ok=True)
 
     def test_drop_managed_table_is_a_noop_when_absent(
         self, monkeypatch: pytest.MonkeyPatch

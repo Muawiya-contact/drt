@@ -186,4 +186,6 @@ class BigQuerySource:
             return
         if table.table_type != "TABLE":
             return
-        client.delete_table(table_id)
+        # Preserve the Protocol's no-op-if-absent contract if another caller
+        # removes the table between the ownership probe and this delete.
+        client.delete_table(table_id, not_found_ok=True)
