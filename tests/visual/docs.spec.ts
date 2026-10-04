@@ -41,7 +41,11 @@ async function expectStableScreenshot(
     caret: "hide",
     fullPage,
     scale: "css",
-    maxDiffPixelRatio: 0.001,
+    // Chromium rasterizes a small number of glyph-edge pixels differently
+    // across Linux hosts even with identical bundled fonts. Keep the budget
+    // below one percent so layout, color, spacing, and content regressions
+    // still fail while host antialiasing noise does not.
+    maxDiffPixelRatio: 0.005,
   });
 }
 
