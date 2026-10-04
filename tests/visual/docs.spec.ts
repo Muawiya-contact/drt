@@ -1,9 +1,23 @@
 import { expect, type Page, test } from "@playwright/test";
 
 const deterministicFonts = `
+  @font-face {
+    font-family: "drt-visual-sans";
+    src: url("/assets/visual-sans.woff2") format("woff2");
+    font-style: normal;
+    font-weight: 100 900;
+    font-display: block;
+  }
+  @font-face {
+    font-family: "drt-visual-mono";
+    src: url("/assets/visual-mono.woff2") format("woff2");
+    font-style: normal;
+    font-weight: 100 900;
+    font-display: block;
+  }
   :root {
-    --sans: "DejaVu Sans", sans-serif !important;
-    --mono: "DejaVu Sans Mono", monospace !important;
+    --sans: "drt-visual-sans", sans-serif !important;
+    --mono: "drt-visual-mono", monospace !important;
   }
 `;
 
