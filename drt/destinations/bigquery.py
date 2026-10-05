@@ -10,6 +10,18 @@ Supports:
   not-matched), then drop the temp table. BigQuery load + MERGE are
   job-level, so merge error handling is batch-level (coarser than the
   per-row staging used by the Snowflake / Databricks destinations).
+- ``sync.mode: replace`` (#1055) — load-job replacement, with two strategies:
+  - ``replace_strategy: truncate`` (default) — the first batch uses
+    ``WRITE_TRUNCATE`` and later batches use ``WRITE_APPEND``. This avoids
+    BigQuery's streaming-buffer restriction on ``TRUNCATE TABLE``.
+  - ``replace_strategy: swap`` — load the same way into a
+    ``<table>__drt_swap_<run-id>`` shadow, then atomically overwrite the target with a
+    copy job using ``WRITE_TRUNCATE`` and drop the shadow.
+- ``sync.mode: mirror`` (#1055) — MERGE each batch, stage its observed keys in
+  ``<table>__drt_mirror_keys_<run-id>``, then delete target rows missing from that key
+  table in :meth:`finalize_sync`. ``mirror.strategy: destination`` (the
+  default) and ``mirror.scope`` are supported; ``tracked`` and ``diff`` are
+  rejected explicitly.
 
 Auth mirrors the BigQuery source: Application Default Credentials by default,
 or a service-account ``keyfile``.
@@ -26,16 +38,35 @@ protocol (``load`` returning a ``SyncResult``, per-row error capture, and
 from __future__ import annotations
 
 import os
+import unicodedata
 from typing import Any
+from uuid import uuid4
 
 from drt.config.models import BigQueryDestinationConfig, DestinationConfig, SyncOptions
 from drt.config.query_tags import normalize_bigquery_label
 from drt.destinations.base import SyncResult
 from drt.destinations.row_errors import RowError, record_row_error
+from drt.destinations.sql_base import _union_columns
+from drt.destinations.sql_utils import (
+    check_mirror_supported,
+    unsupported_tracked_scope_msg,
+)
+
+_SWAP_SUFFIX = "__drt_swap"
+_MIRROR_KEYS_SUFFIX = "__drt_mirror_keys"
+_TMP_SUFFIX = "_drt_tmp"
 
 
 class BigQueryDestination:
     """Write records into BigQuery tables."""
+
+    def __init__(self) -> None:
+        self._replace_started = False
+        self._swap_shadow_created = False
+        self._swap_table_id: str | None = None
+        self._mirror_keys_table_id: str | None = None
+        self._mirror_aborted = False
+        self._run_id = uuid4().hex[:8]
 
     def load(
         self,
@@ -44,18 +75,37 @@ class BigQueryDestination:
         sync_options: SyncOptions,
     ) -> SyncResult:
         assert isinstance(config, BigQueryDestinationConfig)
+        self._validate_sync_options(config, sync_options)
         if not records:
             return SyncResult()
 
-        client = self._build_client(config)
-        result = SyncResult()
-        table_id = f"{config.project}.{config.dataset}.{config.table}"
+        self._validate_records(records)
+        table_id = self._table_id(config)
 
+        if sync_options.mode == "mirror":
+            self._validate_sql_columns(records)
+            self._validate_mirror(records, config, sync_options)
+        elif sync_options.mode != "replace" and config.mode == "merge":
+            self._validate_sql_columns(records)
+            self._validate_upsert_keys_present(records, config.upsert_key)
+
+        client = self._build_client(config)
+        if sync_options.mode == "replace":
+            return self._replace(client, table_id, records, sync_options)
+        if sync_options.mode == "mirror":
+            return self._merge(
+                client,
+                table_id,
+                records,
+                config,
+                sync_options,
+                mirror=True,
+            )
+
+        result = SyncResult()
         if config.mode == "insert":
             self._insert(client, table_id, records, sync_options, result)
         elif config.mode == "merge":
-            if not config.upsert_key:
-                raise ValueError("upsert_key is required for merge mode")
             self._merge(client, table_id, records, config, sync_options, result)
         else:
             raise ValueError(f"Unsupported mode: {config.mode}")
@@ -105,8 +155,10 @@ class BigQueryDestination:
         records: list[dict[str, Any]],
         config: BigQueryDestinationConfig,
         sync_options: SyncOptions,
-        result: SyncResult,
-    ) -> None:
+        result: SyncResult | None = None,
+        *,
+        mirror: bool = False,
+    ) -> SyncResult:
         """Upsert via a temp table + a single MERGE statement.
 
         Both calls are BigQuery *jobs* (unlike ``_insert``'s streaming-insert
@@ -116,25 +168,56 @@ class BigQueryDestination:
         so this builds one of each rather than sharing a single object.
         """
         keys = config.upsert_key
-        assert keys  # guarded in load()
-        tmp_table_id = f"{table_id}_drt_tmp"
-        columns = list(records[0].keys())
+        assert keys  # guarded in load() / _validate_mirror()
+        if result is None:
+            result = SyncResult()
+        tmp_table_id = f"{table_id}{_TMP_SUFFIX}"
+        merge_columns = list(records[0].keys())
+        # The JSON staging schema must cover every field in the upload even
+        # though the existing MERGE statement deliberately retains its
+        # first-record shape pending the sparse-row semantics work in #1137.
+        batch_columns = _union_columns(records)
         labels = self._labels(sync_options._query_tags)
+        mirror_keys_staged = False
 
         try:
+            target_schema = self._get_target_schema(client, table_id)
             client.load_table_from_json(
-                records, tmp_table_id, job_config=self._load_job_config(labels)
+                records,
+                tmp_table_id,
+                job_config=self._load_job_config(
+                    labels,
+                    write_disposition="truncate",
+                    schema=self._schema_for_columns(target_schema, batch_columns),
+                ),
             ).result()
 
-            on_clause = " AND ".join([f"T.{k} = S.{k}" for k in keys])
-            update_cols = [c for c in columns if c not in keys]
-            update_set = ", ".join([f"{c} = S.{c}" for c in update_cols])
-            insert_cols = ", ".join(columns)
-            insert_vals = ", ".join([f"S.{c}" for c in columns])
+            if mirror:
+                self._stage_mirror_keys(
+                    client,
+                    table_id,
+                    records,
+                    keys,
+                    sync_options,
+                    labels,
+                    target_schema,
+                )
+                mirror_keys_staged = True
+
+            on_clause = " AND ".join(
+                [f"T.{self._quote_column(k)} = S.{self._quote_column(k)}" for k in keys]
+            )
+            update_cols = [c for c in merge_columns if c not in keys]
+            update_set = ", ".join(
+                [f"{self._quote_column(c)} = S.{self._quote_column(c)}" for c in update_cols]
+            )
+            insert_cols = ", ".join(self._quote_column(c) for c in merge_columns)
+            insert_vals = ", ".join([f"S.{self._quote_column(c)}" for c in merge_columns])
             matched = f"WHEN MATCHED THEN UPDATE SET {update_set} " if update_cols else ""
 
             merge_sql = (
-                f"MERGE `{table_id}` T USING `{tmp_table_id}` S "
+                f"MERGE {self._quote_table(table_id)} T "
+                f"USING {self._quote_table(tmp_table_id)} S "
                 f"ON {on_clause} "
                 f"{matched}"
                 f"WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
@@ -142,19 +225,408 @@ class BigQueryDestination:
             client.query(merge_sql, job_config=self._query_job_config(labels)).result()
             result.success += len(records)
         except Exception as e:
+            if mirror and not mirror_keys_staged:
+                # Without a complete source-key staging set, the final
+                # anti-join could delete rows this run actually observed.
+                self._mirror_aborted = True
             result.failed += len(records)
-            result.row_errors.append(
+            result.row_errors.extend(
                 RowError(
-                    batch_index=0,
-                    record_preview=str(records[0])[:200],
+                    batch_index=i,
+                    record_preview=str(record)[:200],
                     http_status=None,
                     error_message=str(e),
                 )
+                for i, record in enumerate(records)
             )
             if sync_options.on_error == "fail":
+                if mirror:
+                    self._cleanup_mirror_staging(client)
                 raise
         finally:
             client.delete_table(tmp_table_id, not_found_ok=True)
+
+        return result
+
+    def _replace(
+        self,
+        client: Any,
+        table_id: str,
+        records: list[dict[str, Any]],
+        sync_options: SyncOptions,
+    ) -> SyncResult:
+        """Load one replace batch via atomic BigQuery load-job dispositions."""
+        swap = sync_options.replace_strategy == "swap"
+        destination = self._scratch_table_id(table_id, _SWAP_SUFFIX) if swap else table_id
+        labels = self._labels(sync_options._query_tags)
+        result = SyncResult()
+
+        try:
+            if swap and not self._swap_shadow_created:
+                # Seed the shadow from the target so its schema, partitioning,
+                # and clustering match. The copied rows are immediately
+                # discarded: copy jobs do not copy the target's streaming
+                # buffer, so this shadow is safe to TRUNCATE even when the
+                # live target is not (#1055).
+                client.copy_table(
+                    table_id,
+                    destination,
+                    job_config=self._copy_job_config(labels),
+                ).result()
+                # Track the shadow as soon as the copy succeeds so the
+                # unconditional reset hook can remove it even if the
+                # following TRUNCATE or a later source batch fails.
+                self._swap_table_id = table_id
+                client.query(
+                    f"TRUNCATE TABLE {self._quote_table(destination)}",
+                    job_config=self._query_job_config(labels),
+                ).result()
+                self._swap_shadow_created = True
+
+            disposition = "append" if swap or self._replace_started else "truncate"
+            client.load_table_from_json(
+                records,
+                destination,
+                job_config=self._load_job_config(labels, write_disposition=disposition),
+            ).result()
+            result.success = len(records)
+            if not swap:
+                self._replace_started = True
+        except Exception as e:
+            result.failed = len(records)
+            result.row_errors.extend(
+                RowError(
+                    batch_index=i,
+                    record_preview=str(record)[:200],
+                    http_status=None,
+                    error_message=str(e),
+                )
+                for i, record in enumerate(records)
+            )
+            if sync_options.on_error == "fail":
+                if swap:
+                    try:
+                        client.delete_table(destination, not_found_ok=True)
+                    finally:
+                        self._reset_swap_state()
+                else:
+                    self._replace_started = False
+                raise
+        return result
+
+    def _stage_mirror_keys(
+        self,
+        client: Any,
+        table_id: str,
+        records: list[dict[str, Any]],
+        upsert_key: list[str],
+        sync_options: SyncOptions,
+        labels: dict[str, str] | None,
+        target_schema: list[Any] | None,
+    ) -> None:
+        """Stage observed keys with the target's types, never an IN list.
+
+        The empty CTAS copies the key/scope column types from the target. The
+        subsequent JSON load appends into that existing schema, so an all-NULL
+        scope in the first batch cannot be autodetected as STRING and conflict
+        with a typed value in a later batch.
+        """
+        scope = sync_options.mirror.scope if sync_options.mirror is not None else None
+        columns = list(dict.fromkeys([*upsert_key, *(scope or [])]))
+        column_sql = ", ".join(self._quote_column(c) for c in columns)
+        keys_table_id = self._scratch_table_id(table_id, _MIRROR_KEYS_SUFFIX)
+        keys_table = self._quote_table(keys_table_id)
+        if self._mirror_keys_table_id is None:
+            sql = (
+                f"CREATE OR REPLACE TABLE {keys_table} AS "
+                f"SELECT {column_sql} FROM {self._quote_table(table_id)} WHERE FALSE"
+            )
+            client.query(sql, job_config=self._query_job_config(labels)).result()
+            # Record ownership immediately after CTAS so any later load error
+            # is cleaned by the fail path / reset_write_state.
+            self._mirror_keys_table_id = keys_table_id
+        key_records = [{column: record[column] for column in columns} for record in records]
+        client.load_table_from_json(
+            key_records,
+            keys_table_id,
+            job_config=self._load_job_config(
+                labels,
+                write_disposition="append",
+                schema=self._schema_for_columns(target_schema, columns),
+            ),
+        ).result()
+
+    def finalize_sync(
+        self,
+        config: DestinationConfig,
+        sync_options: SyncOptions,
+    ) -> SyncResult | None:
+        """Finish a swap replace or the mirror delete pass."""
+        assert isinstance(config, BigQueryDestinationConfig)
+        # This must run before every no-op guard below. In particular, a
+        # removal-only ``mirror.strategy: diff`` run never calls load(); if
+        # finalize silently returned here, the engine would promote the new
+        # source snapshot and permanently forget the removed keys.
+        self._validate_sync_options(config, sync_options)
+        if sync_options.mode == "mirror":
+            if sync_options._interrupted:
+                # The staged keys cover only the processed source prefix.
+                # Leave cleanup to the engine's unconditional
+                # reset_write_state() hook; never run the destructive DELETE.
+                return None
+            return self._finalize_mirror(config, sync_options)
+        if sync_options.mode == "replace" and sync_options.replace_strategy != "swap":
+            self._replace_started = False
+            return None
+        if (
+            sync_options.mode != "replace"
+            or not self._swap_shadow_created
+            or self._swap_table_id is None
+        ):
+            return None
+
+        client = self._build_client(config)
+        table_id = self._swap_table_id
+        shadow_table_id = self._scratch_table_id(table_id, _SWAP_SUFFIX)
+        labels = self._labels(sync_options._query_tags)
+        try:
+            client.copy_table(
+                shadow_table_id,
+                table_id,
+                job_config=self._copy_job_config(labels),
+            ).result()
+            return SyncResult()
+        finally:
+            try:
+                client.delete_table(shadow_table_id, not_found_ok=True)
+            finally:
+                self._reset_swap_state()
+
+    def _finalize_mirror(
+        self,
+        config: BigQueryDestinationConfig,
+        sync_options: SyncOptions,
+    ) -> SyncResult | None:
+        keys_table_id = self._mirror_keys_table_id
+        if keys_table_id is None:
+            self._mirror_aborted = False
+            return None
+
+        client = self._build_client(config)
+        labels = self._labels(sync_options._query_tags)
+        try:
+            if self._mirror_aborted:
+                return None
+            upsert_key = config.upsert_key
+            assert upsert_key  # guarded by _validate_mirror()
+            key_match = " AND ".join(
+                [f"T.{self._quote_column(c)} = K.{self._quote_column(c)}" for c in upsert_key]
+            )
+            scope = sync_options.mirror.scope if sync_options.mirror is not None else None
+            scope_prefix = ""
+            if scope:
+                # BigQuery rejects a correlated EXISTS that isn't a plain
+                # equality (IS NOT DISTINCT FROM fails: "LEFT SEMI JOIN
+                # cannot be used without ... equality"); TO_JSON_STRING keeps
+                # it an equality while mapping NULL to 'null' on both sides.
+                scope_match = " AND ".join(
+                    [
+                        f"TO_JSON_STRING(T.{self._quote_column(c)}) = "
+                        f"TO_JSON_STRING(K.{self._quote_column(c)})"
+                        for c in scope
+                    ]
+                )
+                scope_prefix = (
+                    f"EXISTS (SELECT 1 FROM {self._quote_table(keys_table_id)} K "
+                    f"WHERE {scope_match}) AND "
+                )
+            sql = (
+                f"DELETE FROM {self._quote_table(self._table_id(config))} AS T "
+                f"WHERE {scope_prefix}NOT EXISTS "
+                f"(SELECT 1 FROM {self._quote_table(keys_table_id)} K WHERE {key_match})"
+            )
+            client.query(sql, job_config=self._query_job_config(labels)).result()
+            return SyncResult()
+        finally:
+            try:
+                client.delete_table(keys_table_id, not_found_ok=True)
+            finally:
+                self._mirror_keys_table_id = None
+                self._mirror_aborted = False
+
+    def _cleanup_mirror_staging(self, client: Any) -> None:
+        if self._mirror_keys_table_id is not None:
+            client.delete_table(self._mirror_keys_table_id, not_found_ok=True)
+        self._mirror_keys_table_id = None
+        self._mirror_aborted = False
+
+    def _reset_swap_state(self) -> None:
+        self._swap_shadow_created = False
+        self._swap_table_id = None
+
+    def _scratch_table_id(self, table_id: str, suffix: str) -> str:
+        """Return a BigQuery-safe scratch id unique to this write run."""
+        return f"{table_id}{suffix}_{self._run_id}"
+
+    def reset_write_state(
+        self,
+        config: DestinationConfig,
+        sync_options: SyncOptions,
+    ) -> None:
+        """Drop incomplete per-run staging and clear all write bookkeeping.
+
+        Unlike :meth:`finalize_sync`, the engine calls this hook on every exit
+        path, including a source failure after one or more batches. Cleanup is
+        best-effort: attempt every known table, retain the first failure for
+        the engine's warning path, and always clear in-memory state so a reused
+        destination instance starts its next run fresh.
+        """
+        assert isinstance(config, BigQueryDestinationConfig)
+
+        cleanup_table_ids: list[str] = []
+        if self._swap_table_id is not None:
+            cleanup_table_ids.append(self._scratch_table_id(self._swap_table_id, _SWAP_SUFFIX))
+        if self._mirror_keys_table_id is not None:
+            cleanup_table_ids.append(self._mirror_keys_table_id)
+
+        cleanup_error: Exception | None = None
+        try:
+            if cleanup_table_ids:
+                try:
+                    client = self._build_client(config)
+                except Exception as exc:  # noqa: BLE001 — best-effort cleanup hook
+                    cleanup_error = exc
+                else:
+                    for table_id in cleanup_table_ids:
+                        try:
+                            client.delete_table(table_id, not_found_ok=True)
+                        except Exception as exc:  # noqa: BLE001 — try remaining tables
+                            if cleanup_error is None:
+                                cleanup_error = exc
+        finally:
+            self._replace_started = False
+            self._reset_swap_state()
+            self._mirror_keys_table_id = None
+            self._mirror_aborted = False
+            self._run_id = uuid4().hex[:8]
+            sync_options._interrupted = False
+
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    def _validate_sync_options(
+        self,
+        config: BigQueryDestinationConfig,
+        sync_options: SyncOptions,
+    ) -> None:
+        """Reject unsupported run shapes before any BigQuery operation."""
+        mirror = sync_options.mirror
+        if sync_options.mode == "mirror":
+            if "$" in config.table:
+                raise ValueError(
+                    "sync.mode: mirror is not supported for BigQuery "
+                    f"partition-decorated target {config.table!r}; target the "
+                    "base table instead."
+                )
+            if mirror is not None and mirror.strategy == "diff":
+                raise ValueError(
+                    "mirror.strategy: diff is not yet supported on bigquery "
+                    "(the BigQuery diff source exists, but the destination does not "
+                    "consume its removed keys yet); use the default mirror strategy."
+                )
+            if mirror is not None and mirror.strategy == "tracked":
+                raise ValueError(unsupported_tracked_scope_msg("bigquery"))
+            check_mirror_supported(
+                config,
+                sync_options,
+                "bigquery",
+                # BigQuery supports scope with destination strategy. The tracked
+                # strategy was rejected explicitly just above.
+                supports_tracked_scope=True,
+            )
+
+        if (
+            sync_options.mode == "replace"
+            and sync_options.replace_strategy == "swap"
+            and "$" in config.table
+        ):
+            raise ValueError(
+                "replace_strategy: swap is not supported for BigQuery "
+                f"partition-decorated target {config.table!r}; use "
+                "replace_strategy: truncate to replace that partition."
+            )
+
+    def _validate_mirror(
+        self,
+        records: list[dict[str, Any]],
+        config: BigQueryDestinationConfig,
+        sync_options: SyncOptions,
+    ) -> None:
+        mirror = sync_options.mirror
+        assert config.upsert_key
+        self._validate_upsert_keys_present(records, config.upsert_key)
+        null_key_indices = [
+            i
+            for i, record in enumerate(records)
+            if any(record[key] is None for key in config.upsert_key)
+        ]
+        if null_key_indices:
+            raise ValueError(
+                "sync.mode: mirror does not support NULL destination.upsert_key "
+                f"values (record indexes: {null_key_indices})"
+            )
+        if mirror is not None and mirror.scope:
+            missing = [c for c in mirror.scope if not all(c in record for record in records)]
+            if missing:
+                raise ValueError(
+                    "mirror.scope columns missing from the model output: "
+                    f"{missing} (available: {sorted(_union_columns(records))})"
+                )
+
+    def _validate_records(self, records: list[dict[str, Any]]) -> None:
+        empty = [i for i, record in enumerate(records) if not record]
+        if empty:
+            raise ValueError(f"records at index {empty} have no fields at all -- nothing to write")
+
+    def _validate_sql_columns(self, records: list[dict[str, Any]]) -> None:
+        for column in _union_columns(records):
+            self._validate_identifier("column", column)
+
+    def _validate_upsert_keys_present(
+        self, records: list[dict[str, Any]], upsert_key: list[str] | None
+    ) -> None:
+        if not upsert_key:
+            raise ValueError("upsert_key is required for merge mode")
+        missing = [c for c in upsert_key if not all(c in record for record in records)]
+        if missing:
+            raise ValueError(
+                f"upsert_key columns missing from the model output: {missing} "
+                "(every record must include every upsert_key column)"
+            )
+
+    @staticmethod
+    def _validate_identifier(kind: str, value: str) -> str:
+        unsafe = any(char in {"`", "\\"} or unicodedata.category(char) == "Cc" for char in value)
+        if not value or unsafe:
+            raise ValueError(f"Invalid BigQuery {kind} identifier: {value!r}")
+        return value
+
+    def _table_id(self, config: BigQueryDestinationConfig) -> str:
+        project = self._validate_identifier("project", config.project)
+        dataset = self._validate_identifier("dataset", config.dataset)
+        table = self._validate_identifier("table", config.table)
+        return f"{project}.{dataset}.{table}"
+
+    def _quote_column(self, column: str) -> str:
+        return f"`{self._validate_identifier('column', column)}`"
+
+    @staticmethod
+    def _quote_table(table_id: str) -> str:
+        return f"`{table_id}`"
+
+    def supported_modes(self) -> frozenset[str]:
+        """Declare the advanced sync modes implemented by BigQuery (#1055)."""
+        return frozenset({"replace", "mirror"})
 
     def _labels(self, query_tags: dict[str, str] | None) -> dict[str, str] | None:
         """BigQuery-safe label dict from the raw tag payload (#768), or
@@ -166,12 +638,57 @@ class BigQueryDestination:
             normalize_bigquery_label(k): normalize_bigquery_label(v) for k, v in query_tags.items()
         }
 
-    def _load_job_config(self, labels: dict[str, str] | None) -> Any:
-        if labels is None:
+    def _load_job_config(
+        self,
+        labels: dict[str, str] | None,
+        *,
+        write_disposition: str | None = None,
+        schema: list[Any] | None = None,
+    ) -> Any:
+        if labels is None and write_disposition is None and schema is None:
             return None
         from google.cloud import bigquery
 
-        return bigquery.LoadJobConfig(labels=labels)
+        kwargs: dict[str, Any] = {}
+        if labels is not None:
+            kwargs["labels"] = labels
+        if write_disposition is not None:
+            dispositions = {
+                "truncate": bigquery.WriteDisposition.WRITE_TRUNCATE,
+                "append": bigquery.WriteDisposition.WRITE_APPEND,
+            }
+            kwargs["write_disposition"] = dispositions[write_disposition]
+        if schema is not None:
+            kwargs["schema"] = schema
+            kwargs["autodetect"] = False
+        return bigquery.LoadJobConfig(**kwargs)
+
+    @staticmethod
+    def _get_target_schema(client: Any, table_id: str) -> list[Any] | None:
+        """Fetch a target schema once for all staging loads in this batch."""
+        from google.api_core.exceptions import NotFound
+
+        try:
+            return list(client.get_table(table_id).schema)
+        except NotFound:
+            # Preserve load_table_from_json's existing autodetect behavior for
+            # a target that does not exist yet.
+            return None
+
+    @staticmethod
+    def _schema_for_columns(
+        target_schema: list[Any] | None,
+        columns: list[str],
+    ) -> list[Any] | None:
+        """Select target fields in input order, or retain autodetect fallback."""
+        if target_schema is None:
+            return None
+        fields_by_name = {field.name: field for field in target_schema}
+        if any(column not in fields_by_name for column in columns):
+            # A partial explicit schema would reject or discard fields absent
+            # from the target. Keep the pre-existing autodetect path instead.
+            return None
+        return [fields_by_name[column] for column in columns]
 
     def _query_job_config(self, labels: dict[str, str] | None) -> Any:
         if labels is None:
@@ -179,6 +696,16 @@ class BigQueryDestination:
         from google.cloud import bigquery
 
         return bigquery.QueryJobConfig(labels=labels)
+
+    def _copy_job_config(self, labels: dict[str, str] | None) -> Any:
+        from google.cloud import bigquery
+
+        kwargs: dict[str, Any] = {
+            "write_disposition": bigquery.WriteDisposition.WRITE_TRUNCATE,
+        }
+        if labels is not None:
+            kwargs["labels"] = labels
+        return bigquery.CopyJobConfig(**kwargs)
 
     def test_connection(self, config: DestinationConfig) -> None:
         """Test access to the configured target table without creating a job.
@@ -190,7 +717,7 @@ class BigQueryDestination:
         """
         assert isinstance(config, BigQueryDestinationConfig)
         client = self._build_client(config)
-        table_id = f"{config.project}.{config.dataset}.{config.table}"
+        table_id = self._table_id(config)
         client.get_table(table_id)
 
     def _build_client(self, config: BigQueryDestinationConfig) -> Any:
