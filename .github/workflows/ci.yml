@@ -149,6 +149,49 @@ jobs:
           files: coverage.xml
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  docs-visual-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install docs build dependencies
+        run: uv pip install --system -e ".[docs]"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install visual-test dependencies
+        run: npm ci
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Compare docs screenshots
+        run: npm run test:visual
+
+      - name: Upload visual-test report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: docs-visual-regression-report
+          path: |
+            playwright-report/
+            test-results/playwright/
+          if-no-files-found: ignore
+          retention-days: 7
+
   dagster-drt-test:
     # integrations/dagster-drt/tests/ has never run in any CI job: the main
     # `test` job's `testpaths = ["tests"]` (root pyproject.toml) doesn't reach

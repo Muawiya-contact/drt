@@ -1,0 +1,12 @@
+{
+  "name": "drt-visual-regression",
+  "private": true,
+  "scripts": {
+    "test:visual": "playwright test"
+  },
+  "devDependencies": {
+    "@fontsource-variable/roboto": "5.3.0",
+    "@fontsource-variable/roboto-mono": "5.3.0",
+    "@playwright/test": "1.63.0"
+  }
+}
