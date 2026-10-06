@@ -96,18 +96,21 @@ The default `upsert` policy inserts missing rows and updates existing rows.
   not rows matched, so drt performs a key-existence probe only when an UPDATE
   reports zero. That keeps an existing row whose values were already identical
   classified as a success rather than a false no-match.
-- **`create_only`** uses a normal `INSERT`; a MySQL duplicate-key response
-  (`1062`, from a PRIMARY or UNIQUE constraint) is counted as skipped while
-  other data and constraint errors still fail normally. drt deliberately does
-  not use `INSERT IGNORE`, because MySQL can turn invalid values into warnings
-  and insert coerced data, and it does not use a no-op `ON DUPLICATE KEY UPDATE`,
-  because that would activate UPDATE triggers on rows promised to remain
-  untouched.
+- **`create_only`** uses a normal `INSERT`. Because MySQL uses the same `1062`
+  response for every PRIMARY or UNIQUE constraint, drt verifies a duplicate
+  against the configured `upsert_key`: an existing match is counted as skipped,
+  while a collision on some other unique constraint remains a normal row error.
+  drt deliberately does not use `INSERT IGNORE`, because MySQL can turn invalid
+  values into warnings and insert coerced data, and it does not use a no-op
+  `ON DUPLICATE KEY UPDATE`, because that would activate UPDATE triggers on rows
+  promised to remain untouched.
 
-Both policies require a non-empty `upsert_key`. Policy-declined rows increment
-`SyncResult.skipped` and its `skipped_no_match` breakdown; they are not errors.
-The policies compose with field mappings, masks, and lookups, but are rejected
-for `mode: replace` and `mode: mirror`, whose write semantics are incompatible.
+Both policies require a non-empty `upsert_key` and `SELECT` access to the target
+table (the probes run only for ambiguous zero-row updates or duplicate inserts).
+Policy-declined rows increment `SyncResult.skipped` and its `skipped_no_match`
+breakdown; they are not errors. The policies compose with field mappings, masks,
+and lookups, but are rejected for `mode: replace` and `mode: mirror`, whose write
+semantics are incompatible.
 
 **Replace mode (TRUNCATE + INSERT):**
 ```yaml

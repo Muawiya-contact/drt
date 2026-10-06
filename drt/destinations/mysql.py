@@ -552,6 +552,9 @@ class MySQLDestination(BaseSqlDestination):
                 # ON DUPLICATE KEY UPDATE would fire UPDATE triggers even
                 # though create_only promises to leave existing rows alone.
                 sql = MySQLDestination._build_insert_sql(config.table, run_columns)
+                exists_sql = MySQLDestination._build_match_exists_sql(
+                    config.table, config.upsert_key
+                )
                 value_cols = run_columns
             elif policy == "update_only":
                 if not update_cols:
@@ -606,23 +609,43 @@ class MySQLDestination(BaseSqlDestination):
                         result.success += 1
                 except Exception as e:
                     if policy == "create_only" and _is_duplicate_entry(e):
-                        # A duplicate is the expected create_only no-match
-                        # outcome, not a RowError. A normal MySQL statement
-                        # error rolls back that statement only; under
-                        # on_error:skip, also pop the row savepoint so it does
-                        # not accumulate across the rest of the batch.
-                        result.skipped += 1
-                        result.skipped_no_match += 1
-                        no_match_indices.add(i)
-                        if use_savepoint and not self._recover_row_savepoint(conn, cur):
-                            self._mark_batch_aborted(
-                                result,
-                                records,
-                                i,
-                                exclude_indices=frozenset(no_match_indices),
+                        # MySQL reports the same 1062 code for *every* UNIQUE
+                        # constraint. Only a collision on this sync's
+                        # upsert_key is the expected create_only no-match;
+                        # an unrelated unique-key collision remains a real
+                        # row error, matching Postgres' targeted ON CONFLICT.
+                        assert exists_sql is not None
+                        try:
+                            key_values = [
+                                _serialize_value(record.get(c), c, config.json_columns, schema_map)
+                                for c in config.upsert_key
+                            ]
+                            cur.execute(exists_sql, key_values)
+                            duplicate_matches = cur.fetchone() is not None
+                        except Exception as probe_error:
+                            duplicate_matches = False
+                            e = RuntimeError(
+                                "create_only could not verify a duplicate against "
+                                f"destination.upsert_key: {probe_error}"
                             )
-                            return result
-                        continue
+
+                        if duplicate_matches:
+                            # A normal MySQL statement error rolls back that
+                            # statement only; under on_error:skip, also pop the
+                            # row savepoint so it does not accumulate across
+                            # the rest of the batch.
+                            result.skipped += 1
+                            result.skipped_no_match += 1
+                            no_match_indices.add(i)
+                            if use_savepoint and not self._recover_row_savepoint(conn, cur):
+                                self._mark_batch_aborted(
+                                    result,
+                                    records,
+                                    i,
+                                    exclude_indices=frozenset(no_match_indices),
+                                )
+                                return result
+                            continue
 
                     self._record_row_error(result, i, record, e)
                     if sync_options.on_error == "fail":

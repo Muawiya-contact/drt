@@ -59,9 +59,10 @@ def test_mysql_create_only_and_update_only_match_policy() -> None:
                     "tenant_id INT NOT NULL, "
                     "user_id INT NOT NULL, "
                     "score INT NOT NULL, "
+                    "email VARCHAR(255) NOT NULL UNIQUE, "
                     "PRIMARY KEY (tenant_id, user_id))"
                 )
-                cur.execute("INSERT INTO scores VALUES (5, 1, 10)")
+                cur.execute("INSERT INTO scores VALUES (5, 1, 10, 'taken@example.com')")
             setup_conn.commit()
         finally:
             setup_conn.close()
@@ -70,8 +71,18 @@ def test_mysql_create_only_and_update_only_match_policy() -> None:
         with patch.object(MySQLDestination, "_connect", return_value=create_conn):
             create_result = MySQLDestination().load(
                 [
-                    {"tenant_id": 5, "user_id": 1, "score": 99},
-                    {"tenant_id": 5, "user_id": 2, "score": 20},
+                    {
+                        "tenant_id": 5,
+                        "user_id": 1,
+                        "score": 99,
+                        "email": "other@example.com",
+                    },
+                    {
+                        "tenant_id": 5,
+                        "user_id": 2,
+                        "score": 20,
+                        "email": "new@example.com",
+                    },
                 ],
                 _config(),
                 SyncOptions(match_policy="create_only"),
@@ -81,6 +92,29 @@ def test_mysql_create_only_and_update_only_match_policy() -> None:
         assert create_result.skipped == 1
         assert create_result.skipped_no_match == 1
         assert create_result.failed == 0
+
+        collision_conn = _connect(mysql)
+        with patch.object(MySQLDestination, "_connect", return_value=collision_conn):
+            collision_result = MySQLDestination().load(
+                [
+                    {
+                        "tenant_id": 7,
+                        "user_id": 1,
+                        "score": 30,
+                        # The email exists, but the configured composite
+                        # upsert key does not. This is a real constraint
+                        # error, not a create_only no-match skip.
+                        "email": "taken@example.com",
+                    }
+                ],
+                _config(),
+                SyncOptions(match_policy="create_only", on_error="skip"),
+            )
+
+        assert collision_result.success == 0
+        assert collision_result.skipped == 0
+        assert collision_result.skipped_no_match == 0
+        assert collision_result.failed == 1
 
         update_conn = _connect(mysql)
         with patch.object(MySQLDestination, "_connect", return_value=update_conn):

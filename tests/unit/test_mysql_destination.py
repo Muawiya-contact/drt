@@ -164,6 +164,7 @@ class TestMySQLMatchPolicy:
                 raise Exception(1062, "Duplicate entry for PRIMARY")
 
         cur.execute.side_effect = execute_side_effect
+        cur.fetchone.return_value = (1,)
         mock_connect.return_value = conn
 
         result = MySQLDestination().load(
@@ -175,8 +176,10 @@ class TestMySQLMatchPolicy:
             _options(match_policy="create_only"),
         )
 
-        writes = [call for call in cur.execute.call_args_list if len(call.args) > 1]
-        assert all(call.args[0].startswith("INSERT INTO") for call in writes)
+        writes = [
+            call for call in cur.execute.call_args_list if call.args[0].startswith("INSERT INTO")
+        ]
+        assert len(writes) == 2
         assert all("IGNORE" not in call.args[0] for call in writes)
         assert all("ON DUPLICATE KEY" not in call.args[0] for call in writes)
         assert result.success == 1
@@ -201,6 +204,43 @@ class TestMySQLMatchPolicy:
 
         assert result.success == 0
         assert result.skipped == 0
+        assert result.skipped_no_match == 0
+        assert result.failed == 1
+        conn.rollback.assert_called_once()
+
+    @patch("drt.destinations.mysql.MySQLDestination._connect")
+    def test_create_only_does_not_swallow_unrelated_unique_collision(
+        self, mock_connect: MagicMock
+    ) -> None:
+        conn = _fake_connection()
+        cur = conn.cursor()
+
+        def execute_side_effect(sql: str, *args: Any) -> None:
+            if sql.startswith("INSERT INTO"):
+                raise Exception(1062, "Duplicate entry 'taken@example.com' for key 'email'")
+
+        cur.execute.side_effect = execute_side_effect
+        cur.fetchone.return_value = None
+        mock_connect.return_value = conn
+
+        result = MySQLDestination().load(
+            [
+                {
+                    "user_id": 2,
+                    "company_id": 5,
+                    "score": 0.80,
+                    "email": "taken@example.com",
+                }
+            ],
+            _config(),
+            _options(match_policy="create_only"),
+        )
+
+        probe = cur.execute.call_args_list[1]
+        assert probe.args[0].startswith("SELECT 1 FROM `learning_profiles`")
+        assert probe.args[1] == [2, 5]
+        assert result.success == 0
+        assert result.skipped == 0
         assert result.failed == 1
         conn.rollback.assert_called_once()
 
@@ -214,6 +254,7 @@ class TestMySQLMatchPolicy:
                 raise Exception(1062, "Duplicate entry for PRIMARY")
 
         cur.execute.side_effect = execute_side_effect
+        cur.fetchone.return_value = (1,)
         mock_connect.return_value = conn
 
         result = MySQLDestination().load(
