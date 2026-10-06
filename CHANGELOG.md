@@ -64,6 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **MySQL `sync.match_policy` support** ([#757](https://github.com/drt-hub/drt/issues/757), MySQL leg): `update_only` now emits a keyed `UPDATE` and skips missing destination rows, while an existence probe disambiguates MySQL's zero-row response for an existing row whose values were already unchanged. `create_only` uses a plain `INSERT` and treats only duplicate-key error `1062` as a normal no-match skip, avoiding `INSERT IGNORE`'s data-coercion behavior and no-op upserts that would fire UPDATE triggers. Both paths support composite keys, preserve the existing per-row savepoint/error accounting, and report policy-declined rows through `skipped` / `skipped_no_match`. Focused unit tests cover SQL shape, unchanged-row detection, duplicate vs. real errors, and rollback accounting; a Testcontainers smoke test covers both policies against MySQL 8.0.
+
 ## [1.1.0] - 2026-10-06
 
 **Warehouse parity.** Every capability that shipped Postgres-first in v1.0 (managed tables, warehouse-backed state/history/DLQ, diff-based incremental, `replace`/`mirror`, `mirror.strategy: diff`) now reaches Snowflake, Databricks and BigQuery, each leg verified against a live warehouse. No breaking changes — drop-in upgrade from v1.0.0.

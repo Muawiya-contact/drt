@@ -75,6 +75,40 @@ Use `json_columns` to **override** introspection with an explicit allowlist — 
 json_columns: [preferences, metadata]
 ```
 
+**Match policy (`match_policy`, [#757](https://github.com/drt-hub/drt/issues/757)) — only-update / only-create:**
+
+```yaml
+sync:
+  mode: upsert
+  match_policy: update_only   # upsert (default) | update_only | create_only
+destination:
+  type: mysql
+  table: crm.contacts
+  upsert_key: [tenant_id, contact_id]
+```
+
+The default `upsert` policy inserts missing rows and updates existing rows.
+`match_policy` can narrow that behavior when either half would be harmful:
+
+- **`update_only`** emits `UPDATE ... SET ... WHERE <upsert_key>`, so a row
+  missing from MySQL is skipped instead of inserted. It requires at least one
+  non-key column and `SELECT` access to the target: MySQL reports rows changed,
+  not rows matched, so drt performs a key-existence probe only when an UPDATE
+  reports zero. That keeps an existing row whose values were already identical
+  classified as a success rather than a false no-match.
+- **`create_only`** uses a normal `INSERT`; a MySQL duplicate-key response
+  (`1062`, from a PRIMARY or UNIQUE constraint) is counted as skipped while
+  other data and constraint errors still fail normally. drt deliberately does
+  not use `INSERT IGNORE`, because MySQL can turn invalid values into warnings
+  and insert coerced data, and it does not use a no-op `ON DUPLICATE KEY UPDATE`,
+  because that would activate UPDATE triggers on rows promised to remain
+  untouched.
+
+Both policies require a non-empty `upsert_key`. Policy-declined rows increment
+`SyncResult.skipped` and its `skipped_no_match` breakdown; they are not errors.
+The policies compose with field mappings, masks, and lookups, but are rejected
+for `mode: replace` and `mode: mirror`, whose write semantics are incompatible.
+
 **Replace mode (TRUNCATE + INSERT):**
 ```yaml
 sync:
