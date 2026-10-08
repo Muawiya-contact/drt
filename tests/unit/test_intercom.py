@@ -71,8 +71,7 @@ def _conflict(contact_id: str = "contact-123") -> httpx.Response:
                 {
                     "code": "conflict",
                     "message": (
-                        "A contact matching those details already exists "
-                        f"with id={contact_id}"
+                        f"A contact matching those details already exists with id={contact_id}"
                     ),
                 }
             ],
@@ -214,9 +213,7 @@ def test_update_only_searches_by_rendered_identifiers_then_updates() -> None:
 
 
 def test_update_only_uses_a_rendered_intercom_id_without_searching() -> None:
-    config = _config(
-        properties_template='{"id": "{{ row.id }}", "name": "{{ row.name }}"}'
-    )
+    config = _config(properties_template='{"id": "{{ row.id }}", "name": "{{ row.name }}"}')
 
     with (
         patch("httpx.Client.post") as post,

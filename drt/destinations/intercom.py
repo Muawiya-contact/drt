@@ -114,9 +114,7 @@ class IntercomDestination:
         contact_ids: set[str] = set()
         for contact in data:
             if not isinstance(contact, dict) or contact.get("id") in (None, ""):
-                raise ValueError(
-                    "Invalid Intercom contact-search response: contact is missing id."
-                )
+                raise ValueError("Invalid Intercom contact-search response: contact is missing id.")
             contact_ids.add(str(contact["id"]))
         if len(contact_ids) > 1:
             raise ValueError(
