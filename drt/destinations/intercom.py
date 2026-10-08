@@ -62,13 +62,17 @@ class IntercomDestination:
             errors = response.json().get("errors", [])
         except (AttributeError, ValueError):
             return False, None
+        conflict_found = False
         for error in errors:
             if not isinstance(error, dict) or error.get("code") != "conflict":
                 continue
-            message = error.get("message", "")
-            match = re.search(r"\bid=([A-Za-z0-9_-]+)\b", message)
-            return True, match.group(1) if match else None
-        return False, None
+            conflict_found = True
+            message = error.get("message")
+            if isinstance(message, str):
+                match = re.search(r"\bid=([A-Za-z0-9_-]+)\b", message)
+                if match:
+                    return True, match.group(1)
+        return conflict_found, None
 
     def _find_contact_id(
         self,
@@ -163,6 +167,8 @@ class IntercomDestination:
                         payload = json.loads(rendered)
                     except json.JSONDecodeError as e:
                         raise ValueError(f"Invalid Intercom JSON payload: {e}")
+                    if not isinstance(payload, dict):
+                        raise ValueError("Invalid Intercom JSON payload: expected an object.")
 
                     def do_request() -> httpx.Response | None:
                         if policy == "update_only":

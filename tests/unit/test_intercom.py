@@ -116,6 +116,30 @@ def test_upsert_updates_the_contact_id_from_a_duplicate_response() -> None:
     assert put.call_args.kwargs["json"]["email"] == "a@test.com"
 
 
+def test_upsert_finds_the_contact_id_in_a_later_conflict_error() -> None:
+    response = _response(
+        409,
+        json={
+            "errors": [
+                {"code": "conflict", "message": None},
+                {
+                    "code": "conflict",
+                    "message": "A contact matching those details already exists with id=existing-8",
+                },
+            ]
+        },
+    )
+
+    with (
+        patch("httpx.Client.post", return_value=response),
+        patch("httpx.Client.put", return_value=_response(method="PUT")) as put,
+    ):
+        result = IntercomDestination().load([_RECORD], _config(), _options())
+
+    assert (result.success, result.skipped, result.failed) == (1, 0, 0)
+    assert put.call_args.args[0] == f"{IntercomDestination.BASE_URL}/existing-8"
+
+
 def test_upsert_does_not_treat_an_unrelated_409_as_a_duplicate() -> None:
     response = _response(
         409,
@@ -339,6 +363,18 @@ def test_invalid_json_template_fails() -> None:
 
     with pytest.raises(Exception):
         IntercomDestination().load([{"email": "a@test.com"}], config, _options(on_error="fail"))
+
+
+def test_non_object_json_payload_fails_before_the_http_request() -> None:
+    config = _config(properties_template='["{{ row.email }}"]')
+
+    with (
+        patch("httpx.Client.post") as post,
+        pytest.raises(ValueError, match="expected an object"),
+    ):
+        IntercomDestination().load([_RECORD], config, _options(on_error="fail"))
+
+    post.assert_not_called()
 
 
 def test_missing_template_field_fails() -> None:
