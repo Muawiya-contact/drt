@@ -160,6 +160,47 @@ def test_upsert_does_not_treat_an_unrelated_409_as_a_duplicate() -> None:
     put.assert_not_called()
 
 
+def test_upsert_does_not_treat_malformed_409_json_as_a_duplicate() -> None:
+    response = httpx.Response(
+        409,
+        text="{",
+        request=httpx.Request("POST", IntercomDestination.BASE_URL),
+    )
+
+    with (
+        patch("httpx.Client.post", return_value=response),
+        patch("httpx.Client.put") as put,
+        pytest.raises(httpx.HTTPStatusError),
+    ):
+        IntercomDestination().load(
+            [_RECORD],
+            _config(),
+            _options(on_error="fail"),
+        )
+
+    put.assert_not_called()
+
+
+def test_upsert_rejects_a_duplicate_response_without_a_contact_id() -> None:
+    response = _response(
+        409,
+        json={"errors": [{"code": "conflict", "message": "contact already exists"}]},
+    )
+
+    with (
+        patch("httpx.Client.post", return_value=response),
+        patch("httpx.Client.put") as put,
+        pytest.raises(ValueError, match="missing existing contact id"),
+    ):
+        IntercomDestination().load(
+            [_RECORD],
+            _config(),
+            _options(on_error="fail"),
+        )
+
+    put.assert_not_called()
+
+
 def test_create_only_creates_a_new_contact() -> None:
     with (
         patch("httpx.Client.post", return_value=_response()) as post,
@@ -304,6 +345,34 @@ def test_update_only_rejects_an_ambiguous_email_match() -> None:
         patch("httpx.Client.post", return_value=search_response),
         patch("httpx.Client.put") as put,
         pytest.raises(ValueError, match="matched multiple contacts"),
+    ):
+        IntercomDestination().load(
+            [_RECORD],
+            _config(),
+            _options("update_only", on_error="fail"),
+        )
+
+    put.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("search_payload", "error"),
+    [
+        ({}, "missing data list"),
+        ({"data": {}}, "data is not a list"),
+        ({"data": [{}]}, "contact is missing id"),
+    ],
+)
+def test_update_only_rejects_malformed_search_results(
+    search_payload: dict[str, Any],
+    error: str,
+) -> None:
+    response = _response(json=search_payload, url=IntercomDestination.SEARCH_URL)
+
+    with (
+        patch("httpx.Client.post", return_value=response),
+        patch("httpx.Client.put") as put,
+        pytest.raises(ValueError, match=error),
     ):
         IntercomDestination().load(
             [_RECORD],
